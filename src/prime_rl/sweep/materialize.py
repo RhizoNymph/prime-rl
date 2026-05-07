@@ -99,6 +99,13 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def record_trial_objective(status_path: Path, value: float | None) -> None:
+    """Persist an objective value into a trial's status.json, preserving other fields."""
+    status = json.loads(status_path.read_text())
+    status["objective"] = value
+    write_json(status_path, status)
+
+
 def validate_target_config(entrypoint: Literal["rl", "sft"], args: list[str]) -> BaseConfig:
     config_cls = RLConfig if entrypoint == "rl" else SFTConfig
     return cli(config_cls, args=args)

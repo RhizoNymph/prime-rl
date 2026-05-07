@@ -59,6 +59,9 @@ flash-attn-3 = ["flash_attn_3"]
 flash-attn-cute = [
     "flash-attn-4",
 ]
+hpo = [
+    "optuna>=4",
+]
 envs = [
     "reverse-text",
     "alphabet-sort",
