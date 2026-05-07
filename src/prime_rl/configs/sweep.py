@@ -188,6 +188,45 @@ class SweepWandbConfig(BaseConfig):
     tags: list[str] = ["sweep"]
 
 
+class ObjectiveConfig(BaseConfig):
+    """Names the metric the sweep optimizes and where to read it from."""
+
+    metric: Annotated[
+        str,
+        Field(description="Metric key inside final_summary.json (forward-slash-separated)."),
+    ]
+    direction: Literal["maximize", "minimize"]
+    source: Literal["final_summary"] = "final_summary"
+
+
+class ThresholdStoppingConfig(BaseConfig):
+    """Halt the study after a trial whose objective is on the wrong side of a threshold."""
+
+    type: Literal["threshold"] = "threshold"
+    threshold: float
+    min_trials: Annotated[
+        int,
+        Field(ge=1, description="Minimum completed trials before threshold can fire."),
+    ] = 1
+
+
+class PatienceStoppingConfig(BaseConfig):
+    """Halt the study after N consecutive completed trials with no improvement."""
+
+    type: Literal["patience"] = "patience"
+    patience: Annotated[int, Field(ge=1, description="Consecutive non-improving trials required to halt.")]
+    min_trials: Annotated[
+        int,
+        Field(ge=1, description="Minimum completed trials before patience can fire."),
+    ] = 1
+
+
+EarlyStoppingConfig: TypeAlias = Annotated[
+    ThresholdStoppingConfig | PatienceStoppingConfig,
+    Field(discriminator="type"),
+]
+
+
 class SweepConfig(BaseConfig):
     """Configures a hyperparameter sweep study."""
 
@@ -199,6 +238,8 @@ class SweepConfig(BaseConfig):
     scheduler: SweepSchedulerConfig = LocalSweepSchedulerConfig()
     parameters: dict[str, SweepParameterConfig]
     wandb: SweepWandbConfig | None = SweepWandbConfig()
+    objective: ObjectiveConfig | None = None
+    early_stopping: EarlyStoppingConfig | None = None
     continue_on_failure: Annotated[
         bool,
         Field(description="Schedule remaining trials when one fails. Set false to halt-on-first-fail."),
@@ -235,5 +276,9 @@ class SweepConfig(BaseConfig):
             raise ValueError(
                 "resume requires a deterministic trial set, but the random strategy has no seed. "
                 "Set strategy.seed so trial IDs match the previous study, or drop resume."
+            )
+        if self.early_stopping is not None and self.objective is None:
+            raise ValueError(
+                "early_stopping requires an objective so the controller knows which metric to compare."
             )
         return self

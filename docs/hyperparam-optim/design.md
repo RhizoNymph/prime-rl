@@ -922,12 +922,18 @@ Add:
 
 Add:
 
-- Metric readers reading `final_summary.json` (final-objective sweeps) and
-  W&B step-indexed history (intermediate metrics), with Prime Monitor as
-  fallback when W&B is disabled.
-- Objective tracking in manifest.
-- Threshold and patience early stopping.
-- SLURM cancellation and local process termination policies.
+- Metric reader for `final_summary.json` (final-objective sweeps); W&B
+  step-indexed history and Prime Monitor fallback are deferred to a later
+  phase (they slot in alongside Optuna/ASHA which need intermediate values).
+- Objective tracking: `ObjectiveConfig` records metric + direction, the
+  controller writes the per-trial value into `status.json` and a best-trial
+  summary into `manifest.json`.
+- Threshold and patience early stopping at trial-completion granularity:
+  after each trial finishes the tracker decides whether to halt new
+  submissions; in-flight trials finish naturally.
+- In-flight termination of running trials and SLURM cancellation are still
+  open and slot in alongside intermediate-metric pruning when ASHA/Hyperband
+  arrive in Phase 5+.
 
 ### Phase 5: Optuna and Hyperband/ASHA
 

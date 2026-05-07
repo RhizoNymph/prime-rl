@@ -3,10 +3,13 @@ import os
 import queue
 import subprocess
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from prime_rl.sweep.materialize import TrialArtifacts, write_json
+
+TrialCompleteCallback = Callable[[TrialArtifacts, int], bool]
 
 
 def utc_now() -> str:
@@ -72,6 +75,7 @@ def _run_sequential(
     gpu_group: list[int] | None,
     continue_on_failure: bool,
     retry_budget: int,
+    on_trial_complete: TrialCompleteCallback | None,
 ) -> int:
     failures = 0
     for artifact in artifacts:
@@ -80,6 +84,8 @@ def _run_sequential(
             failures += 1
             if not continue_on_failure:
                 raise SystemExit(returncode)
+        if on_trial_complete is not None and on_trial_complete(artifact, returncode):
+            break
     return failures
 
 
@@ -89,6 +95,7 @@ def _run_parallel(
     gpu_groups: list[list[int]],
     continue_on_failure: bool,
     retry_budget: int,
+    on_trial_complete: TrialCompleteCallback | None,
 ) -> int:
     """Run trials concurrently, pinning each to a disjoint GPU group.
 
@@ -118,6 +125,8 @@ def _run_parallel(
                 failure_count += 1
             if not continue_on_failure:
                 halt.set()
+        if on_trial_complete is not None and on_trial_complete(artifact, returncode):
+            halt.set()
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         list(executor.map(task, artifacts))
@@ -131,6 +140,7 @@ def run_trials_locally(
     gpu_groups: list[list[int]] | None = None,
     continue_on_failure: bool = True,
     retry_budget: int = 1,
+    on_trial_complete: TrialCompleteCallback | None = None,
 ) -> int:
     """Run trials sequentially or in parallel. Returns the failed-trial count.
 
@@ -138,12 +148,15 @@ def run_trials_locally(
     skipped so ``--resume`` only re-runs unfinished work. For parallel runs
     the caller must pass ``gpu_groups`` with at least ``max_parallel`` disjoint
     device groups; this is validated upstream by ``LocalSweepSchedulerConfig``.
+    The optional ``on_trial_complete`` callback runs after each completed
+    trial; returning True from it halts new submissions while in-flight
+    trials finish.
     """
     pending = [artifact for artifact in artifacts if not _is_completed(artifact)]
 
     if max_parallel == 1:
         single_group = gpu_groups[0] if gpu_groups else None
-        return _run_sequential(pending, single_group, continue_on_failure, retry_budget)
+        return _run_sequential(pending, single_group, continue_on_failure, retry_budget, on_trial_complete)
 
     if gpu_groups is None or len(gpu_groups) < max_parallel:
         raise ValueError(
@@ -151,7 +164,14 @@ def run_trials_locally(
             f"entries (got {0 if gpu_groups is None else len(gpu_groups)})."
         )
 
-    return _run_parallel(pending, max_parallel, gpu_groups[:max_parallel], continue_on_failure, retry_budget)
+    return _run_parallel(
+        pending,
+        max_parallel,
+        gpu_groups[:max_parallel],
+        continue_on_failure,
+        retry_budget,
+        on_trial_complete,
+    )
 
 
 def submit_trials_to_slurm(

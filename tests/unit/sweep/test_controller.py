@@ -55,7 +55,7 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
 
     called = {}
 
-    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None):
         called["count"] = len(artifacts)
         called["max_parallel"] = max_parallel
         called["gpu_groups"] = gpu_groups
@@ -113,7 +113,7 @@ def test_run_sweep_random_strategy_dispatches_through_local_scheduler(tmp_path: 
 
     captured = {}
 
-    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None):
         captured["count"] = len(artifacts)
         captured["parameters"] = [artifact.trial.parameters for artifact in artifacts]
         return 0
@@ -152,7 +152,7 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
 
     runs: list[list[str]] = []
 
-    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None):
         runs.append([artifact.trial.id for artifact in artifacts])
         first_status = json.loads(artifacts[0].status_path.read_text())
         first_status.update({"state": "completed", "returncode": 0})
@@ -175,7 +175,9 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
 
     resume_runs: list[list[str]] = []
 
-    def fake_local_resume(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+    def fake_local_resume(
+        artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None
+    ):
         resume_runs.append(
             [(artifact.trial.id, json.loads(artifact.status_path.read_text())["state"]) for artifact in artifacts]
         )
@@ -189,13 +191,57 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
     assert json.loads(completed_status_path.read_text())["state"] == "completed"
 
 
+def test_run_sweep_records_objective_and_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+
+    seq = iter([0.9, 0.8, 0.2])
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        overrides = [part for part in command if part.endswith("overrides.toml")]
+        if not overrides:
+            return real_run(command, **kwargs)
+        run_dir = Path(overrides[0]).parent / "run"
+        summary_dir = run_dir / "run-fake"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        (summary_dir / "final_summary.json").write_text(json.dumps({"reward": next(seq)}))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5, 3e-5, 1e-4, 1e-3]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        early_stopping={"type": "threshold", "threshold": 0.5},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    summary = manifest["summary"]
+    assert summary["completed"] == 3
+    assert summary["best_value"] == 0.9
+    assert summary["halted_by_early_stopping"] is True
+    assert summary["halt_reason"] == "threshold"
+
+
 def test_run_sweep_passes_gpu_groups_to_local_scheduler(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
 
     captured = {}
 
-    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None):
         captured["max_parallel"] = max_parallel
         captured["gpu_groups"] = gpu_groups
         return 0

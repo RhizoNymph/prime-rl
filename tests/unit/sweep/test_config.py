@@ -250,3 +250,38 @@ def test_int_uniform_rejects_non_divisible_step(tmp_path: Path) -> None:
             strategy={"type": "random", "num_trials": 4},
             parameters={"optim.warmup": {"distribution": "int_uniform", "min": 0, "max": 10, "step": 4}},
         )
+
+
+def test_objective_config_round_trips(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        objective={"metric": "val/loss", "direction": "minimize"},
+    )
+    assert config.objective.metric == "val/loss"
+    assert config.objective.direction == "minimize"
+    assert config.objective.source == "final_summary"
+
+
+def test_early_stopping_requires_objective(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="early_stopping requires an objective"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            parameters={"optim.lr": {"values": [1e-5]}},
+            early_stopping={"type": "patience", "patience": 3},
+        )
+
+
+def test_early_stopping_threshold_parses(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        objective={"metric": "val/loss", "direction": "minimize"},
+        early_stopping={"type": "threshold", "threshold": 5.0, "min_trials": 2},
+    )
+    assert config.early_stopping.type == "threshold"
+    assert config.early_stopping.threshold == 5.0
+    assert config.early_stopping.min_trials == 2
