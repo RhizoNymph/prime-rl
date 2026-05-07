@@ -162,6 +162,122 @@ def test_optuna_marks_failed_materialization_in_storage(tmp_path: Path, monkeypa
     assert not any(state == optuna.trial.TrialState.RUNNING for state in states)
 
 
+def test_optuna_resume_reconciles_running_trial_with_recorded_objective(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Crash after subprocess finished but before study.tell(): replay the value."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.7, 0.6])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    config = SweepConfig(**base_kwargs)
+    config.strategy.num_trials = 1
+    run_sweep(config)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    completed_trial = study.trials[0]
+    completed_value = completed_trial.value
+    completed_params = dict(completed_trial.params)
+
+    # Simulate the post-completion-but-pre-tell crash: ask another trial,
+    # leave it RUNNING, and have its sweep status.json record an objective.
+    pending = study.ask()
+    pending_index = pending.number
+    pending_id = f"{pending_index:04d}-fake"
+    trial_dir = tmp_path / "study" / "trials" / pending_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trial_dir / "status.json"
+    status_path.write_text(json.dumps({"state": "completed", "returncode": 0, "objective": 0.95}))
+
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"].append(
+        {
+            "id": pending_id,
+            "label": pending_id,
+            "status_path": status_path.as_posix(),
+            "output_dir": (trial_dir / "run").as_posix(),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    resume_config = SweepConfig(**base_kwargs, resume=True)
+    run_sweep(resume_config)
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    states = [t.state for t in study.trials]
+    assert all(state == optuna.trial.TrialState.COMPLETE for state in states)
+    values = sorted(t.value for t in study.trials)
+    assert values == sorted([completed_value, 0.95])
+    assert dict(study.trials[0].params) == completed_params
+
+
+def test_optuna_resume_reconciles_running_trial_with_no_recorded_objective(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Crash before subprocess finished: mark the orphaned trial FAIL."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4, 0.5])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    initial = SweepConfig(**base_kwargs)
+    initial.strategy.num_trials = 1
+    run_sweep(initial)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    study.ask()  # leak a RUNNING trial
+
+    run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    states = [t.state for t in study.trials]
+    # Reconciliation marks the orphan FAIL; the failed slot still counts
+    # toward the num_trials budget, matching Optuna's own optimize() semantics.
+    assert optuna.trial.TrialState.RUNNING not in states
+    assert optuna.trial.TrialState.FAIL in states
+    assert sum(1 for s in states if s == optuna.trial.TrialState.COMPLETE) == 1
+
+
 def test_optuna_sweep_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})

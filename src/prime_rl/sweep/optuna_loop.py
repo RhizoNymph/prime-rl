@@ -116,6 +116,55 @@ def _seed_tracker_from_previous(tracker: TrialOutcomeTracker, previous_variants:
         )
 
 
+def _variant_status_for_trial_number(
+    previous_variants: list[dict[str, Any]],
+    trial_number: int,
+) -> dict[str, Any] | None:
+    """Match an Optuna trial number to its sweep trial via the ``NNNN-...`` id prefix."""
+    prefix = f"{trial_number:04d}-"
+    for variant in previous_variants:
+        if not variant.get("id", "").startswith(prefix):
+            continue
+        status_path = Path(variant.get("status_path", ""))
+        if not status_path.exists():
+            return None
+        return json.loads(status_path.read_text())
+    return None
+
+
+def _reconcile_running_trials(optuna: Any, study: Any, previous_variants: list[dict[str, Any]]) -> int:
+    """Tell Optuna about any RUNNING trials left over from an interrupted run.
+
+    A controller crash between ``study.ask()`` and ``study.tell()`` leaves a
+    trial RUNNING in persistent storage forever. On resume we walk those
+    trials and:
+
+    - if the matching sweep status.json shows ``completed`` with a finite
+      objective, tell Optuna the value so adaptive sampling can use it;
+    - otherwise tell ``TrialState.FAIL`` so the slot stops blocking.
+
+    Returns the number of trials reconciled, mostly for tests / logging.
+    """
+    reconciled = 0
+    for trial in study.trials:
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+        status = _variant_status_for_trial_number(previous_variants, trial.number)
+        objective: float | None = None
+        if status is not None and status.get("state") == "completed":
+            value = status.get("objective")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                objective = float(value)
+        # study.tell() accepts a trial number or a Trial; FrozenTrial is not
+        # accepted, so pass trial.number.
+        if objective is not None:
+            study.tell(trial.number, objective)
+        else:
+            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        reconciled += 1
+    return reconciled
+
+
 def run_optuna_sweep(
     config: SweepConfig,
     write_manifest_with_variants: Any,
@@ -144,8 +193,12 @@ def run_optuna_sweep(
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
 
     previous_variants = _load_previous_variants(config) if config.resume else []
-    if config.resume and tracker is not None:
-        _seed_tracker_from_previous(tracker, previous_variants)
+    if config.resume:
+        reconciled = _reconcile_running_trials(optuna, study, previous_variants)
+        if reconciled:
+            print(f"Reconciled {reconciled} RUNNING Optuna trial(s) from interrupted resume.")
+        if tracker is not None:
+            _seed_tracker_from_previous(tracker, previous_variants)
 
     artifacts: list[TrialArtifacts] = []
     failures = 0
