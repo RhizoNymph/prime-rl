@@ -127,6 +127,10 @@ def _merge_wandb_overrides(config: SweepConfig, flat_overrides: dict[str, Any], 
 TERMINAL_RESUME_STATES = frozenset({"completed", "submitted"})
 
 
+class SweepDriftError(RuntimeError):
+    """Raised when --resume would skip a trial whose effective config has changed."""
+
+
 def _existing_terminal_status(status_path: Path) -> dict[str, Any] | None:
     """Return parsed status.json if its state should be preserved on resume."""
     if not status_path.exists():
@@ -137,7 +141,47 @@ def _existing_terminal_status(status_path: Path) -> dict[str, Any] | None:
     return None
 
 
-def materialize_trial(config: SweepConfig, trial: Trial, resume: bool = False) -> TrialArtifacts:
+def _check_resume_drift(
+    trial: Trial,
+    preserved_status: dict[str, Any],
+    expected: dict[str, Any] | None,
+    new_resolved_checksum: str,
+    new_base_checksums: dict[str, str],
+) -> None:
+    """Refuse to skip a terminal trial whose recorded config differs from the live one.
+
+    Trial IDs hash sweep parameters only, so a base TOML edit between runs
+    leaves the ID stable while the resolved config changes underneath us.
+    Without this check ``--resume`` would silently honor the old ``status.json``
+    and skip work that no longer reflects the current configuration.
+    """
+    if expected is None:
+        return
+
+    expected_resolved = expected.get("resolved_checksum")
+    expected_bases = expected.get("base_checksums") or {}
+
+    changed_bases = [
+        base for base, checksum in new_base_checksums.items() if expected_bases.get(base, checksum) != checksum
+    ]
+    resolved_drift = expected_resolved is not None and expected_resolved != new_resolved_checksum
+
+    if not (changed_bases or resolved_drift):
+        return
+
+    detail = f"changed base files: {changed_bases}" if changed_bases else "the resolved config changed"
+    raise SweepDriftError(
+        f"Refusing to skip {preserved_status['state']} trial {trial.id} on resume because "
+        f"{detail}. Drop --resume to start fresh, revert the change, or remove the trial directory."
+    )
+
+
+def materialize_trial(
+    config: SweepConfig,
+    trial: Trial,
+    resume: bool = False,
+    expected_checksums: dict[str, Any] | None = None,
+) -> TrialArtifacts:
     trial_dir = config.output_dir / "trials" / trial.id
     run_dir = trial_dir / "run"
     overrides_path = trial_dir / "overrides.toml"
@@ -167,7 +211,9 @@ def materialize_trial(config: SweepConfig, trial: Trial, resume: bool = False) -
     base_checksums = {base.as_posix(): file_checksum(base) for base in config.base}
 
     preserved_status = _existing_terminal_status(status_path) if resume else None
-    if preserved_status is None:
+    if preserved_status is not None:
+        _check_resume_drift(trial, preserved_status, expected_checksums, resolved_checksum, base_checksums)
+    else:
         write_json(
             status_path,
             {

@@ -43,7 +43,7 @@ def test_sweep_config_loads_from_cli_toml(tmp_path: Path) -> None:
             "entrypoint": "sft",
             "base": ["base.toml"],
             "output_dir": "outputs/study",
-            "scheduler": {"type": "slurm", "max_parallel": 4},
+            "scheduler": {"type": "slurm"},
             "parameters": {"optim.lr": {"values": [1e-5]}},
         },
     )
@@ -52,8 +52,17 @@ def test_sweep_config_loads_from_cli_toml(tmp_path: Path) -> None:
 
     assert config.entrypoint == "sft"
     assert config.scheduler.type == "slurm"
-    assert config.scheduler.max_parallel == 4
     assert config.parameters["optim.lr"].values == [1e-5]
+
+
+def test_slurm_scheduler_rejects_max_parallel(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "max_parallel": 4},
+            parameters={"optim.lr": {"values": [1e-5]}},
+        )
 
 
 def test_sweep_config_requires_base(tmp_path: Path) -> None:

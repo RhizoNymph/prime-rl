@@ -77,17 +77,16 @@ def run_trials_locally(
 
 def submit_trials_to_slurm(
     artifacts: list[TrialArtifacts],
-    max_parallel: int = 1,
     continue_on_failure: bool = True,
     retry_budget: int = 1,
 ) -> int:
     """Submit trials through the target entrypoint's SLURM support.
 
-    The target entrypoint owns SLURM rendering/submission. max_parallel is kept
-    in the config for forward compatibility with controller-managed queues.
-    Submission failures (not job failures) are retried up to retry_budget.
+    The target entrypoint owns SLURM rendering/submission. Throughput is
+    governed by the cluster's own scheduling, not this controller, so there
+    is no in-flight cap here. Submission failures (not job failures) are
+    retried up to ``retry_budget``.
     """
-    _ = max_parallel
     failures = 0
     for artifact in artifacts:
         if _is_submitted_or_completed(artifact):

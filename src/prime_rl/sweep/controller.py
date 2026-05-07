@@ -63,15 +63,35 @@ def _expand_trials(config: SweepConfig) -> list[Trial]:
     raise ValueError(f"Unsupported sweep strategy: {config.strategy!r}")
 
 
+def _previous_checksums(config: SweepConfig) -> dict[str, dict[str, Any]]:
+    """Map trial_id -> {resolved_checksum, base_checksums} from the prior manifest."""
+    manifest_path = config.output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    manifest = json.loads(manifest_path.read_text())
+    return {
+        variant["id"]: {
+            "resolved_checksum": variant.get("resolved_checksum"),
+            "base_checksums": variant.get("base_checksums") or {},
+        }
+        for variant in manifest.get("variants", [])
+    }
+
+
 def _materialize_study(config: SweepConfig) -> list[TrialArtifacts]:
     if config.output_dir.exists() and config.clean_output_dir:
         shutil.rmtree(config.output_dir)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    expected = _previous_checksums(config) if config.resume else {}
+
     _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
 
     trials = _expand_trials(config)
-    artifacts = [materialize_trial(config, trial, resume=config.resume) for trial in trials]
+    artifacts = [
+        materialize_trial(config, trial, resume=config.resume, expected_checksums=expected.get(trial.id))
+        for trial in trials
+    ]
     _write_manifest(config, artifacts)
     return artifacts
 
@@ -95,7 +115,6 @@ def run_sweep(config: SweepConfig) -> None:
     elif isinstance(config.scheduler, SlurmSweepSchedulerConfig):
         failures = submit_trials_to_slurm(
             artifacts,
-            max_parallel=config.scheduler.max_parallel,
             continue_on_failure=config.continue_on_failure,
             retry_budget=config.retry_budget,
         )

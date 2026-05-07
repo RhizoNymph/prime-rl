@@ -124,11 +124,15 @@ class LocalSweepSchedulerConfig(BaseConfig):
 
 
 class SlurmSweepSchedulerConfig(BaseConfig):
-    """Submit generated trials through the target entrypoint's SLURM support."""
+    """Submit generated trials through the target entrypoint's SLURM support.
+
+    Throughput is governed by the SLURM cluster, not this scheduler. A
+    controller-managed in-flight cap will land in a later phase; until then
+    there is intentionally no ``max_parallel`` knob to avoid promising
+    throttling we do not enforce.
+    """
 
     type: Literal["slurm"] = "slurm"
-
-    max_parallel: Annotated[int, Field(ge=1, description="Maximum SLURM submissions to keep in flight.")] = 1
 
 
 SweepSchedulerConfig: TypeAlias = Annotated[
