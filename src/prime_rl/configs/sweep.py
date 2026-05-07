@@ -61,6 +61,12 @@ class IntUniformParameterConfig(BaseConfig):
     def validate_range(self):
         if self.min >= self.max:
             raise ValueError("Int-uniform parameter requires min < max")
+        if (self.max - self.min) % self.step != 0:
+            raise ValueError(
+                f"Int-uniform range [{self.min}, {self.max}] is not divisible by step {self.step}; "
+                "non-divisible ranges silently truncate the search space (the inclusive max is never sampled). "
+                "Pick a step that divides (max - min) evenly."
+            )
         return self
 
 
@@ -182,4 +188,9 @@ class SweepConfig(BaseConfig):
                     "Grid strategy only supports choice (values=...) parameters, "
                     f"but these declare distributions instead: {non_choice}"
                 )
+        if self.resume and isinstance(self.strategy, RandomStrategyConfig) and self.strategy.seed is None:
+            raise ValueError(
+                "resume requires a deterministic trial set, but the random strategy has no seed. "
+                "Set strategy.seed so trial IDs match the previous study, or drop resume."
+            )
         return self

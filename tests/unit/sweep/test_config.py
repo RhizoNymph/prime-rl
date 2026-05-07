@@ -137,3 +137,35 @@ def test_resume_and_clean_output_dir_are_mutually_exclusive(tmp_path: Path) -> N
             resume=True,
             clean_output_dir=True,
         )
+
+
+def test_resume_rejects_unseeded_random_strategy(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="seed"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            strategy={"type": "random", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "uniform", "min": 0.0, "max": 1.0}},
+            resume=True,
+        )
+
+
+def test_resume_accepts_seeded_random_strategy(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={"type": "random", "num_trials": 4, "seed": 11},
+        parameters={"optim.lr": {"distribution": "uniform", "min": 0.0, "max": 1.0}},
+        resume=True,
+    )
+    assert config.strategy.seed == 11
+
+
+def test_int_uniform_rejects_non_divisible_step(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="divisible"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            strategy={"type": "random", "num_trials": 4},
+            parameters={"optim.warmup": {"distribution": "int_uniform", "min": 0, "max": 10, "step": 4}},
+        )
