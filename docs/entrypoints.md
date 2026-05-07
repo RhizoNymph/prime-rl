@@ -65,3 +65,11 @@ uv run torchrun --nproc-per-node 8 src/prime_rl/trainer/sft/train.py ...
 ```
 
 For more details on multi-node deployment options, see the [deployment](deployment.md) documentation and see the [examples](examples) for concrete training configurations. To see all available configuration options, run `uv run sft --help`.
+
+## Sweep
+
+The `sweep` entrypoint materializes and launches grid sweep trials for `rl` or `sft` target configs.
+
+Each trial gets a stable directory under the study output directory with generated `overrides.toml`, fully resolved `resolved.toml`, `command.txt`, and `status.json`. The launcher validates every target trial config before launching. SLURM sweeps reuse the target `rl` or `sft` config's existing `[slurm]` support.
+
+To see all sweep configuration options, run `uv run sweep --help`.

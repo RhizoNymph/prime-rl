@@ -75,6 +75,16 @@ curl http://localhost:8000/v1/chat/completions \
 - **Entrypoint:** `src/prime_rl/entrypoints/inference.py`
 - **SLURM:** yes — single-node, multi-node, and disaggregated deployments
 
+## `sweep` — Hyperparameter sweeps
+
+Materializes and launches hyperparameter sweep trials for `rl` or `sft` target configs.
+
+Phase 1 supports grid sweeps over dotted target config paths. Each trial writes `overrides.toml`, `resolved.toml`, `command.txt`, and `status.json` under the study output directory, then launches the target entrypoint with the configured base files plus the generated `overrides.toml` unless `--dry-run` is set.
+
+- **Config:** `SweepConfig` (`src/prime_rl/configs/sweep.py`)
+- **Entrypoint:** `src/prime_rl/entrypoints/sweep.py`
+- **SLURM:** yes, through the target `rl`/`sft` config's existing `[slurm]` support
+
 ## Summary
 
 | Command | Purpose | SLURM | Typical use |
@@ -82,10 +92,11 @@ curl http://localhost:8000/v1/chat/completions \
 | `rl` | Full RL pipeline | yes | Production RL training |
 | `sft` | Supervised fine-tuning | yes | SFT training |
 | `inference` | vLLM server | yes | Standalone inference or debugging |
+| `sweep` | Hyperparameter sweeps | yes | Launching multiple RL/SFT variants |
 
 ## Key directories
 
-- `src/prime_rl/entrypoints/` — top-level entrypoints (`rl`, `sft`, `inference`)
+- `src/prime_rl/entrypoints/` — top-level entrypoints (`rl`, `sft`, `inference`, `sweep`)
 - `src/prime_rl/configs/` — all config classes
 - `configs/debug/` — minimal configs for quick testing
 - `examples/` — full example configs for various tasks

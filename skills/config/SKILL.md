@@ -63,6 +63,12 @@ uv run rl @ examples/reverse_text/rl.toml --dry-run --output-dir /tmp/test
 # Writes resolved TOML to /tmp/test/configs
 ```
 
+Sweep configs also support `--dry-run`. A sweep dry-run validates the sweep and target trial configs, writes study/trial artifacts, and does not launch target runs:
+
+```bash
+uv run sweep @ path/to/sweep.toml --dry-run
+```
+
 ## Naming
 
 CLI uses kebab-case (`--model.max-model-len`), TOML uses snake_case (`max_model_len`). Both refer to the same field.
@@ -130,6 +136,18 @@ On the CLI, pass as a JSON string:
 
 ```bash
 uv run inference --vllm-extra '{"key1": "value1", "key2": 123}'
+```
+
+### Sweep parameter paths
+
+Sweep configs use dotted target config paths under `[parameters]`. The sweep launcher converts these to generated override TOML files and then validates the target `rl` or `sft` config normally:
+
+```toml
+[parameters."trainer.optim.lr"]
+values = [1e-5, 3e-5]
+
+[parameters."orchestrator.train.sampling.temperature"]
+values = [0.7, 1.0]
 ```
 
 ### Discriminated unions
