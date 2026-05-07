@@ -106,20 +106,56 @@ SearchStrategyConfig: TypeAlias = Annotated[
 ]
 
 
+class LocalGpuAssignmentConfig(BaseConfig):
+    """Static round-robin assignment of CUDA_VISIBLE_DEVICES to local workers.
+
+    Each entry in ``visible_devices`` is one device group that pins one trial
+    subprocess. Groups are disjoint by construction so two parallel workers
+    never share a GPU.
+    """
+
+    visible_devices: Annotated[
+        list[list[int]],
+        Field(min_length=1, description="Disjoint device groups assigned to parallel workers."),
+    ]
+
+    @model_validator(mode="after")
+    def validate_groups(self):
+        if any(not group for group in self.visible_devices):
+            raise ValueError("Each visible_devices group must contain at least one device index")
+        flat = [device for group in self.visible_devices for device in group]
+        if any(device < 0 for device in flat):
+            raise ValueError("visible_devices indices must be non-negative")
+        if len(flat) != len(set(flat)):
+            raise ValueError("Each device may only appear in one visible_devices group")
+        return self
+
+
 class LocalSweepSchedulerConfig(BaseConfig):
     """Run generated trials as local subprocesses."""
 
     type: Literal["local"] = "local"
 
     max_parallel: Annotated[int, Field(ge=1, description="Maximum local trials to run concurrently.")] = 1
+    gpu_assignment: Annotated[
+        LocalGpuAssignmentConfig | None,
+        Field(description="Required for max_parallel > 1; pins each worker to a disjoint device group."),
+    ] = None
 
     @model_validator(mode="after")
-    def reject_parallel_until_phase_3(self):
+    def validate_parallel(self):
         if self.max_parallel > 1:
-            raise ValueError(
-                "Local sweep scheduler does not yet support max_parallel > 1. "
-                "Parallel execution requires explicit GPU assignment (Phase 3)."
-            )
+            if self.gpu_assignment is None:
+                raise ValueError(
+                    "max_parallel > 1 requires explicit gpu_assignment so parallel workers do not "
+                    "silently colocate trainer/inference stacks on the same GPUs."
+                )
+            available = len(self.gpu_assignment.visible_devices)
+            if available < self.max_parallel:
+                raise ValueError(
+                    f"max_parallel={self.max_parallel} requires at least {self.max_parallel} "
+                    f"visible_devices groups, got {available}."
+                )
         return self
 
 
