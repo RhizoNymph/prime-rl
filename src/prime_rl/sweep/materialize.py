@@ -124,7 +124,20 @@ def _merge_wandb_overrides(config: SweepConfig, flat_overrides: dict[str, Any], 
     flat_overrides["wandb.tags"] = list(dict.fromkeys(tags))
 
 
-def materialize_trial(config: SweepConfig, trial: Trial) -> TrialArtifacts:
+TERMINAL_RESUME_STATES = frozenset({"completed", "submitted"})
+
+
+def _existing_terminal_status(status_path: Path) -> dict[str, Any] | None:
+    """Return parsed status.json if its state should be preserved on resume."""
+    if not status_path.exists():
+        return None
+    status = json.loads(status_path.read_text())
+    if status.get("state") in TERMINAL_RESUME_STATES:
+        return status
+    return None
+
+
+def materialize_trial(config: SweepConfig, trial: Trial, resume: bool = False) -> TrialArtifacts:
     trial_dir = config.output_dir / "trials" / trial.id
     run_dir = trial_dir / "run"
     overrides_path = trial_dir / "overrides.toml"
@@ -153,18 +166,20 @@ def materialize_trial(config: SweepConfig, trial: Trial) -> TrialArtifacts:
     resolved_checksum = file_checksum(resolved_path)
     base_checksums = {base.as_posix(): file_checksum(base) for base in config.base}
 
-    write_json(
-        status_path,
-        {
-            "id": trial.id,
-            "label": trial.label,
-            "state": "pending",
-            "pid": None,
-            "slurm_job_id": None,
-            "returncode": None,
-            "objective": None,
-        },
-    )
+    preserved_status = _existing_terminal_status(status_path) if resume else None
+    if preserved_status is None:
+        write_json(
+            status_path,
+            {
+                "id": trial.id,
+                "label": trial.label,
+                "state": "pending",
+                "pid": None,
+                "slurm_job_id": None,
+                "returncode": None,
+                "objective": None,
+            },
+        )
 
     return TrialArtifacts(
         trial=trial,

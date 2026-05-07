@@ -98,3 +98,85 @@ def test_run_sweep_exits_nonzero_when_trials_fail(tmp_path: Path, monkeypatch) -
         assert exc.code == 1
     else:
         raise AssertionError("Expected SystemExit when trials failed")
+
+
+def test_run_sweep_random_strategy_dispatches_through_local_scheduler(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    captured = {}
+
+    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
+        captured["count"] = len(artifacts)
+        captured["parameters"] = [artifact.trial.parameters for artifact in artifacts]
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={"type": "random", "num_trials": 5, "seed": 13},
+        parameters={
+            "optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4},
+            "data.temperature": {"distribution": "uniform", "min": 0.6, "max": 1.2},
+        },
+    )
+
+    run_sweep(config)
+
+    assert captured["count"] == 5
+    for params in captured["parameters"]:
+        assert 1e-6 <= params["optim.lr"] <= 1e-4
+        assert 0.6 <= params["data.temperature"] <= 1.2
+
+
+def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    base_config_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+
+    runs: list[list[str]] = []
+
+    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
+        runs.append([artifact.trial.id for artifact in artifacts])
+        first_status = json.loads(artifacts[0].status_path.read_text())
+        first_status.update({"state": "completed", "returncode": 0})
+        artifacts[0].status_path.write_text(json.dumps(first_status, indent=2, sort_keys=True) + "\n")
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
+
+    run_sweep(SweepConfig(**base_config_kwargs))
+
+    completed_id = runs[0][0]
+    pending_id = runs[0][1]
+
+    completed_status_path = tmp_path / "study" / "trials" / completed_id / "status.json"
+    pending_status_path = tmp_path / "study" / "trials" / pending_id / "status.json"
+    assert json.loads(completed_status_path.read_text())["state"] == "completed"
+    pending_status = json.loads(pending_status_path.read_text())
+    pending_status.update({"state": "failed", "returncode": 1})
+    pending_status_path.write_text(json.dumps(pending_status, indent=2, sort_keys=True) + "\n")
+
+    resume_runs: list[list[str]] = []
+
+    def fake_local_resume(artifacts, max_parallel, continue_on_failure, retry_budget):
+        resume_runs.append(
+            [(artifact.trial.id, json.loads(artifact.status_path.read_text())["state"]) for artifact in artifacts]
+        )
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local_resume)
+
+    run_sweep(SweepConfig(**base_config_kwargs, resume=True))
+
+    assert resume_runs[0] == [(completed_id, "completed"), (pending_id, "pending")]
+    assert json.loads(completed_status_path.read_text())["state"] == "completed"

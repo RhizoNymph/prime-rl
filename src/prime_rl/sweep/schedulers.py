@@ -38,13 +38,25 @@ def _run_with_retries(artifact: TrialArtifacts, retry_budget: int) -> int:
             return result.returncode
 
 
+def _is_completed(artifact: TrialArtifacts) -> bool:
+    return _read_status(artifact).get("state") == "completed"
+
+
+def _is_submitted_or_completed(artifact: TrialArtifacts) -> bool:
+    return _read_status(artifact).get("state") in {"completed", "submitted"}
+
+
 def run_trials_locally(
     artifacts: list[TrialArtifacts],
     max_parallel: int = 1,
     continue_on_failure: bool = True,
     retry_budget: int = 1,
 ) -> int:
-    """Run trials sequentially. Returns the count of failed trials."""
+    """Run trials sequentially. Returns the count of failed trials.
+
+    Trials whose status.json already records ``state == "completed"`` are
+    skipped so ``--resume`` only re-runs the work that did not finish.
+    """
     if max_parallel != 1:
         raise ValueError(
             f"Local sweep scheduler only supports max_parallel=1 (got {max_parallel}). "
@@ -53,6 +65,8 @@ def run_trials_locally(
 
     failures = 0
     for artifact in artifacts:
+        if _is_completed(artifact):
+            continue
         returncode = _run_with_retries(artifact, retry_budget)
         if returncode != 0:
             failures += 1
@@ -76,6 +90,8 @@ def submit_trials_to_slurm(
     _ = max_parallel
     failures = 0
     for artifact in artifacts:
+        if _is_submitted_or_completed(artifact):
+            continue
         attempts = 0
         while True:
             attempts += 1

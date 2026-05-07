@@ -79,3 +79,31 @@ def test_materialize_trial_rejects_bad_target_path(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("Expected target config validation to fail")
+
+
+def test_materialize_trial_preserves_completed_status_on_resume(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    trial = Trial(id="0000-deadbeef", label="lr_1e-5", parameters={"optim.lr": 1e-5})
+
+    artifact = materialize_trial(config, trial)
+    completed = json.loads(artifact.status_path.read_text())
+    completed.update({"state": "completed", "returncode": 0, "objective": 0.42})
+    artifact.status_path.write_text(json.dumps(completed, indent=2, sort_keys=True) + "\n")
+
+    materialize_trial(config, trial, resume=True)
+    after = json.loads(artifact.status_path.read_text())
+    assert after["state"] == "completed"
+    assert after["objective"] == 0.42
+
+    materialize_trial(config, trial, resume=False)
+    reset = json.loads(artifact.status_path.read_text())
+    assert reset["state"] == "pending"

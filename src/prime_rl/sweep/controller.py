@@ -5,11 +5,17 @@ from typing import Any
 
 import tomli_w
 
-from prime_rl.configs.sweep import LocalSweepSchedulerConfig, SlurmSweepSchedulerConfig, SweepConfig
-from prime_rl.sweep.materialize import TrialArtifacts, materialize_trial
+from prime_rl.configs.sweep import (
+    GridStrategyConfig,
+    LocalSweepSchedulerConfig,
+    RandomStrategyConfig,
+    SlurmSweepSchedulerConfig,
+    SweepConfig,
+)
+from prime_rl.sweep.materialize import Trial, TrialArtifacts, materialize_trial
 from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import run_trials_locally, submit_trials_to_slurm
-from prime_rl.sweep.search import expand_grid
+from prime_rl.sweep.search import expand_grid, sample_random
 
 
 def _write_toml(path: Path, data: dict[str, Any]) -> None:
@@ -37,12 +43,24 @@ def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> Non
     manifest = {
         "name": config.name,
         "entrypoint": config.entrypoint,
-        "strategy": config.strategy,
+        "strategy": config.strategy.model_dump(mode="json"),
         "scheduler": config.scheduler.model_dump(mode="json"),
         "git": git_metadata(),
         "variants": variants,
     }
     (config.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _expand_trials(config: SweepConfig) -> list[Trial]:
+    if isinstance(config.strategy, GridStrategyConfig):
+        return expand_grid(config.parameters)
+    if isinstance(config.strategy, RandomStrategyConfig):
+        return sample_random(
+            config.parameters,
+            num_trials=config.strategy.num_trials,
+            seed=config.strategy.seed,
+        )
+    raise ValueError(f"Unsupported sweep strategy: {config.strategy!r}")
 
 
 def _materialize_study(config: SweepConfig) -> list[TrialArtifacts]:
@@ -52,8 +70,8 @@ def _materialize_study(config: SweepConfig) -> list[TrialArtifacts]:
 
     _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
 
-    trials = expand_grid(config.parameters)
-    artifacts = [materialize_trial(config, trial) for trial in trials]
+    trials = _expand_trials(config)
+    artifacts = [materialize_trial(config, trial, resume=config.resume) for trial in trials]
     _write_manifest(config, artifacts)
     return artifacts
 
