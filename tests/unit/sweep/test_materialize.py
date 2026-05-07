@@ -48,7 +48,15 @@ def test_materialize_trial_writes_artifacts(tmp_path: Path) -> None:
 
     status = json.loads(artifact.status_path.read_text())
     assert status["state"] == "pending"
-    assert artifact.command == ["uv", "run", "sft", "@", artifact.resolved_path.as_posix()]
+    assert artifact.command == [
+        "uv",
+        "run",
+        "sft",
+        "@",
+        base_path.as_posix(),
+        "@",
+        artifact.overrides_path.as_posix(),
+    ]
     assert artifact.command_path.read_text().strip() == " ".join(artifact.command)
 
 

@@ -67,8 +67,22 @@ def trial_label(parameters: dict[str, Any], max_len: int = 96) -> str:
     return label if len(label) <= max_len else ""
 
 
-def command_for_trial(entrypoint: Literal["rl", "sft"], resolved_path: Path) -> list[str]:
-    return ["uv", "run", entrypoint, "@", resolved_path.as_posix()]
+def command_for_trial(
+    entrypoint: Literal["rl", "sft"],
+    base_paths: list[Path],
+    overrides_path: Path,
+) -> list[str]:
+    """Compose the launcher command from base files plus the generated overrides.
+
+    This matches the form a user would type by hand and keeps per-trial diffs
+    small. The frozen ``resolved.toml`` is written separately as a reproducible
+    artifact but is not used as the launch input.
+    """
+    cmd = ["uv", "run", entrypoint]
+    for base in base_paths:
+        cmd.extend(["@", base.as_posix()])
+    cmd.extend(["@", overrides_path.as_posix()])
+    return cmd
 
 
 def write_toml(path: Path, data: dict[str, Any]) -> None:
@@ -130,7 +144,7 @@ def materialize_trial(config: SweepConfig, trial: Trial) -> TrialArtifacts:
     resolved_config = validate_target_config(config.entrypoint, args)
     write_toml(resolved_path, _target_config_to_toml(resolved_config))
 
-    command = command_for_trial(config.entrypoint, resolved_path)
+    command = command_for_trial(config.entrypoint, config.base, overrides_path)
     command_path.write_text(" ".join(command) + "\n")
 
     write_json(
