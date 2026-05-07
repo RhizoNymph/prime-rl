@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from prime_rl.sweep.materialize import TrialArtifacts, write_json
+from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 
 TrialCompleteCallback = Callable[[TrialArtifacts, int], bool]
 
@@ -26,12 +27,19 @@ def _write_status(artifacts: TrialArtifacts, **updates) -> None:
     write_json(artifacts.status_path, status)
 
 
-def _build_env(gpu_group: list[int] | None) -> dict[str, str] | None:
-    """Inherit the parent env but pin CUDA_VISIBLE_DEVICES for the trial."""
-    if gpu_group is None:
-        return None
+def _metrics_jsonl_path(artifact: TrialArtifacts) -> str:
+    return (artifact.run_dir / "metrics.jsonl").as_posix()
+
+
+def _build_env(artifact: TrialArtifacts, gpu_group: list[int] | None) -> dict[str, str]:
+    """Inherit the parent env, pin CUDA_VISIBLE_DEVICES, and route the trial's
+    step-indexed metrics to the canonical sidecar file the sweep controller
+    reads (final objective + intermediate pruning).
+    """
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in gpu_group)
+    if gpu_group is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in gpu_group)
+    env[SWEEP_METRICS_JSONL_ENV] = _metrics_jsonl_path(artifact)
     return env
 
 
@@ -42,7 +50,7 @@ def _run_with_retries(artifact: TrialArtifacts, gpu_group: list[int] | None, ret
     ``running`` transition with the cumulative attempt count and the assigned
     device group in status.json.
     """
-    env = _build_env(gpu_group)
+    env = _build_env(artifact, gpu_group)
     attempts = 0
     while True:
         attempts += 1
