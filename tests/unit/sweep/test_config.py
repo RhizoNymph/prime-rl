@@ -152,7 +152,22 @@ def test_local_max_parallel_with_gpu_assignment_validates(tmp_path: Path) -> Non
         parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
     )
     assert config.scheduler.max_parallel == 2
+    assert config.scheduler.gpu_assignment.mode == "static"
     assert config.scheduler.gpu_assignment.visible_devices == [[0, 1], [2, 3]]
+
+
+def test_local_gpu_assignment_accepts_documented_static_mode(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "local",
+            "max_parallel": 2,
+            "gpu_assignment": {"mode": "static", "visible_devices": [[0, 1], [2, 3]]},
+        },
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+    assert config.scheduler.gpu_assignment.mode == "static"
 
 
 def test_random_strategy_accepts_distribution_parameters(tmp_path: Path) -> None:

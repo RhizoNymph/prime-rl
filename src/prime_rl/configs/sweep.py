@@ -111,9 +111,12 @@ class LocalGpuAssignmentConfig(BaseConfig):
 
     Each entry in ``visible_devices`` is one device group that pins one trial
     subprocess. Groups are disjoint by construction so two parallel workers
-    never share a GPU.
+    never share a GPU. ``mode`` is currently fixed to ``"static"``; future
+    modes (``"exclusive"`` for live GPU discovery, ``"none"`` to leave
+    ``CUDA_VISIBLE_DEVICES`` untouched) will land in later phases.
     """
 
+    mode: Literal["static"] = "static"
     visible_devices: Annotated[
         list[list[int]],
         Field(min_length=1, description="Disjoint device groups assigned to parallel workers."),
