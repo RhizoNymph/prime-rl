@@ -38,8 +38,10 @@ def test_run_sweep_dry_run_materializes_without_launching(tmp_path: Path, monkey
 
     assert not launched
     manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
-    assert [variant["id"] for variant in manifest["variants"]] == ["0000", "0001"]
-    assert (tmp_path / "study" / "trials" / "0000" / "resolved.toml").exists()
+    variant_ids = [variant["id"] for variant in manifest["variants"]]
+    assert [vid[:4] for vid in variant_ids] == ["0000", "0001"]
+    assert all(len(vid) == 13 and vid[4] == "-" for vid in variant_ids)
+    assert (tmp_path / "study" / "trials" / variant_ids[0] / "resolved.toml").exists()
 
 
 def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> None:
