@@ -222,6 +222,7 @@ def materialize_trial(
                 "state": "pending",
                 "pid": None,
                 "slurm_job_id": None,
+                "gpu_group": None,
                 "returncode": None,
                 "objective": None,
             },

@@ -88,14 +88,86 @@ def test_sweep_parameter_requires_values(tmp_path: Path) -> None:
         )
 
 
-def test_local_scheduler_rejects_parallel_until_phase_3(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="max_parallel > 1"):
+def test_local_max_parallel_requires_gpu_assignment(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="gpu_assignment"):
         SweepConfig(
             base=[tmp_path / "base.toml"],
             output_dir=tmp_path / "study",
             scheduler={"type": "local", "max_parallel": 2},
             parameters={"optim.lr": {"values": [1e-5]}},
         )
+
+
+def test_local_max_parallel_requires_enough_gpu_groups(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="requires at least"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "local",
+                "max_parallel": 4,
+                "gpu_assignment": {"visible_devices": [[0], [1]]},
+            },
+            parameters={"optim.lr": {"values": [1e-5]}},
+        )
+
+
+def test_local_gpu_assignment_rejects_overlapping_groups(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="only appear in one"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "local",
+                "max_parallel": 2,
+                "gpu_assignment": {"visible_devices": [[0, 1], [1, 2]]},
+            },
+            parameters={"optim.lr": {"values": [1e-5]}},
+        )
+
+
+def test_local_gpu_assignment_rejects_empty_group(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="at least one device"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "local",
+                "max_parallel": 2,
+                "gpu_assignment": {"visible_devices": [[0], []]},
+            },
+            parameters={"optim.lr": {"values": [1e-5]}},
+        )
+
+
+def test_local_max_parallel_with_gpu_assignment_validates(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "local",
+            "max_parallel": 2,
+            "gpu_assignment": {"visible_devices": [[0, 1], [2, 3]]},
+        },
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+    assert config.scheduler.max_parallel == 2
+    assert config.scheduler.gpu_assignment.mode == "static"
+    assert config.scheduler.gpu_assignment.visible_devices == [[0, 1], [2, 3]]
+
+
+def test_local_gpu_assignment_accepts_documented_static_mode(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "local",
+            "max_parallel": 2,
+            "gpu_assignment": {"mode": "static", "visible_devices": [[0, 1], [2, 3]]},
+        },
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+    assert config.scheduler.gpu_assignment.mode == "static"
 
 
 def test_random_strategy_accepts_distribution_parameters(tmp_path: Path) -> None:

@@ -55,9 +55,10 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
 
     called = {}
 
-    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
         called["count"] = len(artifacts)
         called["max_parallel"] = max_parallel
+        called["gpu_groups"] = gpu_groups
         called["continue_on_failure"] = continue_on_failure
         called["retry_budget"] = retry_budget
         return 0
@@ -73,7 +74,13 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
 
     run_sweep(config)
 
-    assert called == {"count": 1, "max_parallel": 1, "continue_on_failure": True, "retry_budget": 1}
+    assert called == {
+        "count": 1,
+        "max_parallel": 1,
+        "gpu_groups": None,
+        "continue_on_failure": True,
+        "retry_budget": 1,
+    }
 
 
 def test_run_sweep_exits_nonzero_when_trials_fail(tmp_path: Path, monkeypatch) -> None:
@@ -106,7 +113,7 @@ def test_run_sweep_random_strategy_dispatches_through_local_scheduler(tmp_path: 
 
     captured = {}
 
-    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
         captured["count"] = len(artifacts)
         captured["parameters"] = [artifact.trial.parameters for artifact in artifacts]
         return 0
@@ -145,7 +152,7 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
 
     runs: list[list[str]] = []
 
-    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
         runs.append([artifact.trial.id for artifact in artifacts])
         first_status = json.loads(artifacts[0].status_path.read_text())
         first_status.update({"state": "completed", "returncode": 0})
@@ -168,7 +175,7 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
 
     resume_runs: list[list[str]] = []
 
-    def fake_local_resume(artifacts, max_parallel, continue_on_failure, retry_budget):
+    def fake_local_resume(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
         resume_runs.append(
             [(artifact.trial.id, json.loads(artifact.status_path.read_text())["state"]) for artifact in artifacts]
         )
@@ -180,3 +187,33 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
 
     assert resume_runs[0] == [(completed_id, "completed"), (pending_id, "pending")]
     assert json.loads(completed_status_path.read_text())["state"] == "completed"
+
+
+def test_run_sweep_passes_gpu_groups_to_local_scheduler(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    captured = {}
+
+    def fake_local(artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget):
+        captured["max_parallel"] = max_parallel
+        captured["gpu_groups"] = gpu_groups
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "local",
+            "max_parallel": 2,
+            "gpu_assignment": {"visible_devices": [[0, 1], [2, 3]]},
+        },
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+
+    run_sweep(config)
+
+    assert captured == {"max_parallel": 2, "gpu_groups": [[0, 1], [2, 3]]}

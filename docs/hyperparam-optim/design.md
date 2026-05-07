@@ -574,11 +574,16 @@ base file checksum against the value recorded in the manifest at materialization
 time; if it changed, the launcher errors out unless the user explicitly opts
 into the new content.
 
-Initial behavior:
+Behavior:
 
-- Sequential only. `max_parallel > 1` is rejected with a configuration error
-  until Phase 3 introduces explicit GPU assignment. Allowing it earlier risks
-  silently colocating two trainer/inference stacks on the same GPUs.
+- `max_parallel = 1` (default) runs trials sequentially with no `gpu_assignment`
+  required.
+- `max_parallel > 1` is allowed when `[scheduler.gpu_assignment]` declares at
+  least that many disjoint `visible_devices` groups (Phase 3). Each parallel
+  worker holds one group for the lifetime of its subprocess, so two trials
+  never share a GPU. Without `gpu_assignment` the validator rejects
+  `max_parallel > 1` to avoid silently colocating trainer/inference stacks on
+  the same devices.
 - Failure handling is governed by the failure-policy fields documented under
   [Failure Semantics](#failure-semantics): `continue_on_failure` (default
   `true`) and `retry_budget` (default `1`).
@@ -597,15 +602,18 @@ mode = "static"
 visible_devices = [[0, 1], [2, 3]]
 ```
 
-Supported future modes:
+Modes:
 
-- `static`: assign declared `CUDA_VISIBLE_DEVICES` groups round-robin.
-- `exclusive`: inspect available GPUs before launching and reserve a group for
-  the subprocess.
-- `none`: do not set `CUDA_VISIBLE_DEVICES`.
+- `static` (Phase 3, current default): assign declared `CUDA_VISIBLE_DEVICES`
+  groups round-robin to parallel workers.
+- `exclusive` (future): inspect available GPUs before launching and reserve a
+  group for the subprocess.
+- `none` (future): do not set `CUDA_VISIBLE_DEVICES`; fall back to whatever
+  the parent environment exposes.
 
-The scheduler must write the assigned devices to `status.json` and include them
-in the logged command environment.
+The scheduler writes the assigned devices to `status.json` (`gpu_group`) and
+sets `CUDA_VISIBLE_DEVICES` on the subprocess environment so retries and
+post-mortems can see which devices ran which trial.
 
 ### SLURM Scheduler
 
@@ -901,11 +909,14 @@ Add:
 
 Add:
 
-- Explicit local GPU assignment.
-- Static `CUDA_VISIBLE_DEVICES` groups.
-- Parallel local scheduler with resource ownership recorded in `status.json`.
-- Optional GPU availability checks.
-- Lift the Phase-1 prohibition on `max_parallel > 1`.
+- Explicit local GPU assignment via `[scheduler.gpu_assignment]`.
+- Static `CUDA_VISIBLE_DEVICES` groups (`mode = "static"`); `exclusive` mode
+  (live GPU discovery) and `none` mode are deferred to a later phase.
+- Parallel local scheduler (`ThreadPoolExecutor` over a queue of GPU groups)
+  with resource ownership recorded in `status.json` as `gpu_group`.
+- Lift the Phase-1 prohibition on `max_parallel > 1`; the validator now
+  rejects `max_parallel > 1` only when `gpu_assignment` is missing or has
+  fewer groups than `max_parallel`.
 
 ### Phase 4: Metrics and Early Stopping
 
@@ -971,8 +982,12 @@ the resolutions here so the rationale is visible to future work:
   fixes flow into resumed trials. `resolved.toml` is still written as a
   reproducible single-file artifact; the manifest records resolved-config and
   base-file checksums to detect drift.
-- **Local `max_parallel > 1`** — rejected with a configuration error until
-  Phase 3 introduces explicit GPU assignment. Phase 1 is sequential only.
+- **Local `max_parallel > 1`** — supported as of Phase 3 when paired with
+  `[scheduler.gpu_assignment] mode = "static"` declaring at least
+  `max_parallel` disjoint `visible_devices` groups. The validator still
+  rejects `max_parallel > 1` without `gpu_assignment` so two parallel
+  workers cannot silently colocate on the same GPUs. `exclusive` and
+  `none` modes are still future work.
 - **Optuna packaging** — `prime-rl[hpo]` extra. The validator emits a clear
   install hint when `strategy.type = "optuna"` is requested without the extra.
 - **Canonical metric source** — `final_summary.json` for final-objective

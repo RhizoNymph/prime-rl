@@ -106,9 +106,13 @@ def run_sweep(config: SweepConfig) -> None:
         return
 
     if isinstance(config.scheduler, LocalSweepSchedulerConfig):
+        gpu_groups = (
+            config.scheduler.gpu_assignment.visible_devices if config.scheduler.gpu_assignment is not None else None
+        )
         failures = run_trials_locally(
             artifacts,
             max_parallel=config.scheduler.max_parallel,
+            gpu_groups=gpu_groups,
             continue_on_failure=config.continue_on_failure,
             retry_budget=config.retry_budget,
         )
