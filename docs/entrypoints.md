@@ -70,11 +70,6 @@ For more details on multi-node deployment options, see the [deployment](deployme
 
 The `sweep` entrypoint materializes and launches grid sweep trials for `rl` or `sft` target configs.
 
-```bash
-uv run sweep @ examples/reverse_text/sweep.toml
-uv run sweep @ examples/reverse_text/sweep.toml --dry-run
-```
-
 Each trial gets a stable directory under the study output directory with generated `overrides.toml`, fully resolved `resolved.toml`, `command.txt`, and `status.json`. The launcher validates every target trial config before launching. SLURM sweeps reuse the target `rl` or `sft` config's existing `[slurm]` support.
 
 To see all sweep configuration options, run `uv run sweep --help`.

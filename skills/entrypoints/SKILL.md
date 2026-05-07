@@ -79,12 +79,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 Materializes and launches hyperparameter sweep trials for `rl` or `sft` target configs.
 
-```bash
-uv run sweep @ configs/debug/sweep/rl_grid.toml
-uv run sweep @ configs/debug/sweep/rl_grid.toml --dry-run
-```
-
-Phase 1 supports grid sweeps over dotted target config paths. Each trial writes `overrides.toml`, `resolved.toml`, `command.txt`, and `status.json` under the study output directory, then launches the target entrypoint with `uv run <rl|sft> @ <resolved.toml>` unless `--dry-run` is set.
+Phase 1 supports grid sweeps over dotted target config paths. Each trial writes `overrides.toml`, `resolved.toml`, `command.txt`, and `status.json` under the study output directory, then launches the target entrypoint with the configured base files plus the generated `overrides.toml` unless `--dry-run` is set.
 
 - **Config:** `SweepConfig` (`src/prime_rl/configs/sweep.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/sweep.py`
