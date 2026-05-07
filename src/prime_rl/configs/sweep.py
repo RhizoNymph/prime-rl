@@ -25,6 +25,15 @@ class LocalSweepSchedulerConfig(BaseConfig):
 
     max_parallel: Annotated[int, Field(ge=1, description="Maximum local trials to run concurrently.")] = 1
 
+    @model_validator(mode="after")
+    def reject_parallel_until_phase_3(self):
+        if self.max_parallel > 1:
+            raise ValueError(
+                "Local sweep scheduler does not yet support max_parallel > 1. "
+                "Parallel execution requires explicit GPU assignment (Phase 3)."
+            )
+        return self
+
 
 class SlurmSweepSchedulerConfig(BaseConfig):
     """Submit generated trials through the target entrypoint's SLURM support."""

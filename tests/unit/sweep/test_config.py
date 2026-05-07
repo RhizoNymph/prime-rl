@@ -69,3 +69,13 @@ def test_sweep_parameter_requires_values(tmp_path: Path) -> None:
             output_dir=tmp_path / "study",
             parameters={"optim.lr": {"values": []}},
         )
+
+
+def test_local_scheduler_rejects_parallel_until_phase_3(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="max_parallel > 1"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "local", "max_parallel": 2},
+            parameters={"optim.lr": {"values": [1e-5]}},
+        )
