@@ -73,6 +73,15 @@ def _build_sampler(optuna: Any, strategy: OptunaStrategyConfig) -> Any:
 
 
 def _create_study(optuna: Any, config: SweepConfig) -> Any:
+    """Create or reload the Optuna study.
+
+    ``load_if_exists`` is gated on ``config.resume``: a fresh sweep must start
+    from an empty optimization history, otherwise old trials would bias the
+    sampler and the storage would silently accumulate trials across runs that
+    the user thought were independent. With persistent storage and no
+    ``resume`` flag, optuna raises ``DuplicatedStudyError`` to surface the
+    collision instead of attaching silently.
+    """
     strategy = config.strategy
     assert isinstance(strategy, OptunaStrategyConfig)
     assert config.objective is not None  # validated upstream
@@ -82,7 +91,7 @@ def _create_study(optuna: Any, config: SweepConfig) -> Any:
         storage=strategy.storage,
         sampler=_build_sampler(optuna, strategy),
         direction=direction,
-        load_if_exists=True,
+        load_if_exists=config.resume,
     )
 
 

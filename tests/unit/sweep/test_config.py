@@ -334,6 +334,22 @@ def test_optuna_strategy_resume_requires_storage(tmp_path: Path) -> None:
         )
 
 
+def test_optuna_strategy_rejects_max_parallel_gt_one(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Optuna strategy runs sequentially"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "local",
+                "max_parallel": 2,
+                "gpu_assignment": {"visible_devices": [[0], [1]]},
+            },
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
 def test_optuna_strategy_parses_with_storage(tmp_path: Path) -> None:
     config = SweepConfig(
         base=[tmp_path / "base.toml"],

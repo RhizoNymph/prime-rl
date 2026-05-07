@@ -318,6 +318,11 @@ class SweepConfig(BaseConfig):
                     "Optuna strategy is not supported with the SLURM scheduler: the controller "
                     "must observe each trial's objective before proposing the next one."
                 )
+            if isinstance(self.scheduler, LocalSweepSchedulerConfig) and self.scheduler.max_parallel > 1:
+                raise ValueError(
+                    "Optuna strategy runs sequentially (ask/tell needs each trial's objective "
+                    "before proposing the next), so scheduler.max_parallel must be 1."
+                )
             if self.resume and self.strategy.storage is None:
                 raise ValueError(
                     "Resume with the Optuna strategy requires strategy.storage so the study "

@@ -70,6 +70,38 @@ def test_optuna_random_sweep_records_best_trial(tmp_path: Path, monkeypatch) -> 
         assert "optim.warmup" in variant["overrides"]
 
 
+def test_optuna_fresh_run_rejects_existing_study_in_storage(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.5])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+            "study_name": "shared",
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+
+    import optuna
+
+    with pytest.raises(optuna.exceptions.DuplicatedStudyError):
+        run_sweep(SweepConfig(**base_kwargs))
+
+
 def test_optuna_resume_runs_only_remaining_budget(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
