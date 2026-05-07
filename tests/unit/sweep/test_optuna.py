@@ -335,3 +335,233 @@ def test_optuna_sweep_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
     assert summary["halted_by_early_stopping"] is True
     assert summary["halt_reason"] == "threshold"
     assert summary["best_value"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Phase 5b — pruning
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Stand-in for ``subprocess.Popen`` used by the pruning driver tests.
+
+    Drops a metrics.jsonl into the run directory on construction so the
+    polling reader has data on the very first iteration, then reports a
+    configurable returncode after the first ``wait()`` call.
+    """
+
+    def __init__(self, command, env=None, returncode: int = 0, rows=None, **kwargs):
+        self._returncode_value = returncode
+        self._returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+        self.pid = 12345
+        self._waits = 0
+        if env is not None and rows is not None:
+            metrics_path = Path(env["PRIME_RL_SWEEP_METRICS_JSONL"])
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            metrics_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+    def wait(self, timeout=None) -> int:
+        self._waits += 1
+        # First call to wait blocks the polling loop long enough for one
+        # metrics.jsonl read; second call returns the configured returncode.
+        if self._waits >= 2:
+            self._returncode = self._returncode_value
+            return self._returncode_value
+        import subprocess
+
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
+
+
+def _patch_popen_for_trials(monkeypatch, factory) -> None:
+    """Intercept Popen calls from the optuna pruning driver only.
+
+    git_metadata() and other infrastructure also use subprocess (and thus
+    Popen under the hood). Patching Popen globally breaks them; patching the
+    ``subprocess.Popen`` attribute the optuna_loop module imports lets us
+    target only the pruning driver's spawn site.
+    """
+    import subprocess as real_subprocess
+
+    real_popen = real_subprocess.Popen
+
+    def dispatch(command, *args, **kwargs):
+        # Real Popen for everything that is not a trial subprocess (uv run rl/sft
+        # compositions). The trial command shape is `["uv", "run", "rl"|"sft", "@", base, "@", overrides]`.
+        if isinstance(command, (list, tuple)) and command and command[0] == "uv":
+            return factory(command, *args, **kwargs)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr("prime_rl.sweep.optuna_loop.subprocess.Popen", dispatch)
+
+
+def _patch_terminate(monkeypatch, terminated: list[bool]) -> None:
+    def fake_terminate(process, grace_seconds=10.0):
+        # Mirror the real function's idempotency: a finished process is a
+        # no-op so the finally-clause cleanup does not double-count.
+        if process.poll() is not None:
+            return
+        terminated.append(True)
+        process._returncode = -15
+
+    monkeypatch.setattr("prime_rl.sweep.optuna_loop._terminate_process_group", fake_terminate)
+
+
+def test_run_trial_with_pruning_returns_pruned_when_should_prune_fires(tmp_path: Path, monkeypatch) -> None:
+    """The polling driver must terminate the process and return PRUNED when
+    optuna_trial.should_prune() returns True after a report."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-pruneme", label="pruneme", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    rows = [{"step": 1, "reward": 0.05}]
+
+    def popen_factory(*args, **kwargs):
+        return _FakePopen(*args, rows=rows, returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    terminated: list[bool] = []
+    _patch_terminate(monkeypatch, terminated)
+
+    reports: list[tuple[int, float]] = []
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            reports.append((step, value))
+
+        def should_prune(self):
+            return True
+
+    outcome = _run_trial_with_pruning(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+    )
+
+    assert outcome.state == "pruned"
+    assert outcome.pruned_at_step == 1
+    assert outcome.pruned_value == 0.05
+    assert reports == [(1, 0.05)]
+    assert terminated == [True]
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "pruned"
+    assert status["pruned_at_step"] == 1
+    assert status["pruned_value"] == 0.05
+    assert status["objective"] is None
+
+
+def test_run_trial_with_pruning_records_objective_on_clean_completion(tmp_path: Path, monkeypatch) -> None:
+    """A trial that runs to completion without should_prune firing returns the
+    final value from metrics.jsonl and is recorded as completed."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-good", label="good", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    rows = [{"step": 1, "reward": 0.1}, {"step": 2, "reward": 0.4}]
+
+    def popen_factory(*args, **kwargs):
+        return _FakePopen(*args, rows=rows, returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    _patch_terminate(monkeypatch, [])
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.4
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
+
+
+def test_optuna_sweep_with_median_pruner_runs_to_completion(tmp_path: Path, monkeypatch) -> None:
+    """End-to-end: sweep with median pruner enabled runs through the pruning
+    code path. Trials with monotonically-improving metrics should not be
+    pruned, so all trials complete successfully."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    final_rewards = iter([0.4, 0.7, 0.9])
+
+    def popen_factory(*args, **kwargs):
+        reward = next(final_rewards)
+        rows = [{"step": 1, "reward": reward}]
+        return _FakePopen(*args, rows=rows, returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 3,
+            "sampler": "random",
+            "seed": 7,
+            "pruner": {"type": "median", "n_startup_trials": 1, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["strategy"]["pruner"]["type"] == "median"
+    assert len(manifest["variants"]) == 3
+    summary = manifest["summary"]
+    # All three trials produced a valid objective; pruner only fires when the
+    # trajectory is below the median, which is impossible with one prior
+    # completion + an improving series.
+    assert summary["completed"] == 3
+    assert summary["best_value"] == 0.9
