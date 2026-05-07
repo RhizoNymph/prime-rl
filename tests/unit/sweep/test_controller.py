@@ -60,6 +60,7 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
         called["max_parallel"] = max_parallel
         called["continue_on_failure"] = continue_on_failure
         called["retry_budget"] = retry_budget
+        return 0
 
     monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
 
@@ -73,3 +74,27 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
     run_sweep(config)
 
     assert called == {"count": 1, "max_parallel": 1, "continue_on_failure": True, "retry_budget": 1}
+
+
+def test_run_sweep_exits_nonzero_when_trials_fail(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.run_trials_locally",
+        lambda *args, **kwargs: 2,
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+    )
+
+    try:
+        run_sweep(config)
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("Expected SystemExit when trials failed")
