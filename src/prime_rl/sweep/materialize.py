@@ -8,6 +8,7 @@ import tomli_w
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.sweep import SweepConfig
+from prime_rl.sweep.reproducibility import file_checksum
 from prime_rl.utils.config import BaseConfig, cli
 
 
@@ -28,6 +29,8 @@ class TrialArtifacts:
     command_path: Path
     status_path: Path
     command: list[str]
+    resolved_checksum: str
+    base_checksums: dict[str, str]
 
 
 def set_dotted_path(data: dict[str, Any], path: str, value: Any) -> None:
@@ -147,6 +150,9 @@ def materialize_trial(config: SweepConfig, trial: Trial) -> TrialArtifacts:
     command = command_for_trial(config.entrypoint, config.base, overrides_path)
     command_path.write_text(" ".join(command) + "\n")
 
+    resolved_checksum = file_checksum(resolved_path)
+    base_checksums = {base.as_posix(): file_checksum(base) for base in config.base}
+
     write_json(
         status_path,
         {
@@ -169,4 +175,6 @@ def materialize_trial(config: SweepConfig, trial: Trial) -> TrialArtifacts:
         command_path=command_path,
         status_path=status_path,
         command=command,
+        resolved_checksum=resolved_checksum,
+        base_checksums=base_checksums,
     )

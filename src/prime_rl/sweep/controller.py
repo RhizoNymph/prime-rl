@@ -7,6 +7,7 @@ import tomli_w
 
 from prime_rl.configs.sweep import LocalSweepSchedulerConfig, SlurmSweepSchedulerConfig, SweepConfig
 from prime_rl.sweep.materialize import TrialArtifacts, materialize_trial
+from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import run_trials_locally, submit_trials_to_slurm
 from prime_rl.sweep.search import expand_grid
 
@@ -28,6 +29,8 @@ def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> Non
                 "overrides": artifact.trial.parameters,
                 "command": artifact.command,
                 "status_path": artifact.status_path.as_posix(),
+                "resolved_checksum": artifact.resolved_checksum,
+                "base_checksums": artifact.base_checksums,
             }
         )
 
@@ -36,6 +39,7 @@ def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> Non
         "entrypoint": config.entrypoint,
         "strategy": config.strategy,
         "scheduler": config.scheduler.model_dump(mode="json"),
+        "git": git_metadata(),
         "variants": variants,
     }
     (config.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

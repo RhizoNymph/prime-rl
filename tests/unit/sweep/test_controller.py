@@ -42,6 +42,11 @@ def test_run_sweep_dry_run_materializes_without_launching(tmp_path: Path, monkey
     assert [vid[:4] for vid in variant_ids] == ["0000", "0001"]
     assert all(len(vid) == 13 and vid[4] == "-" for vid in variant_ids)
     assert (tmp_path / "study" / "trials" / variant_ids[0] / "resolved.toml").exists()
+    assert "git" in manifest
+    assert set(manifest["git"]) == {"sha", "dirty"}
+    for variant in manifest["variants"]:
+        assert len(variant["resolved_checksum"]) == 64
+        assert variant["base_checksums"][base_path.as_posix()]
 
 
 def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> None:
