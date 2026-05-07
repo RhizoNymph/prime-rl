@@ -29,22 +29,20 @@ def _write_toml(path: Path, data: dict[str, Any]) -> None:
         tomli_w.dump(data, f)
 
 
-def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> None:
-    variants = []
-    for artifact in artifacts:
-        variants.append(
-            {
-                "id": artifact.trial.id,
-                "label": artifact.trial.label,
-                "output_dir": artifact.run_dir.as_posix(),
-                "overrides": artifact.trial.parameters,
-                "command": artifact.command,
-                "status_path": artifact.status_path.as_posix(),
-                "resolved_checksum": artifact.resolved_checksum,
-                "base_checksums": artifact.base_checksums,
-            }
-        )
+def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
+    return {
+        "id": artifact.trial.id,
+        "label": artifact.trial.label,
+        "output_dir": artifact.run_dir.as_posix(),
+        "overrides": artifact.trial.parameters,
+        "command": artifact.command,
+        "status_path": artifact.status_path.as_posix(),
+        "resolved_checksum": artifact.resolved_checksum,
+        "base_checksums": artifact.base_checksums,
+    }
 
+
+def write_manifest_with_variants(config: SweepConfig, variants: list[dict[str, Any]]) -> None:
     manifest = {
         "name": config.name,
         "entrypoint": config.entrypoint,
@@ -56,6 +54,10 @@ def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> Non
         "variants": variants,
     }
     (config.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> None:
+    write_manifest_with_variants(config, [build_variant(a) for a in artifacts])
 
 
 def _update_manifest_summary(config: SweepConfig, summary: dict[str, Any] | None) -> None:
@@ -157,7 +159,11 @@ def _run_optuna(config: SweepConfig) -> None:
         )
         return
 
-    failures, tracker, artifacts = run_optuna_sweep(config, write_manifest=_write_manifest)
+    failures, tracker, artifacts = run_optuna_sweep(
+        config,
+        write_manifest_with_variants=write_manifest_with_variants,
+        build_variant=build_variant,
+    )
 
     if tracker is not None:
         summary = asdict(tracker.summary())

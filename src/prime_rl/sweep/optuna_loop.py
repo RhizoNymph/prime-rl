@@ -10,7 +10,9 @@ a follow-up phase.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from prime_rl.configs.sweep import (
@@ -90,15 +92,42 @@ def _make_trial(index: int, parameters: dict[str, Any]) -> Trial:
     return Trial(id=trial_id, label=label, parameters=parameters)
 
 
+def _load_previous_variants(config: SweepConfig) -> list[dict[str, Any]]:
+    manifest_path = config.output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    return json.loads(manifest_path.read_text()).get("variants", []) or []
+
+
+def _seed_tracker_from_previous(tracker: TrialOutcomeTracker, previous_variants: list[dict[str, Any]]) -> None:
+    for variant in previous_variants:
+        status_path = Path(variant.get("status_path", ""))
+        if not status_path.exists():
+            continue
+        status = json.loads(status_path.read_text())
+        if status.get("state") != "completed":
+            continue
+        tracker.observe(
+            TrialOutcome(
+                trial_id=variant.get("id", ""),
+                label=variant.get("label", "") or variant.get("id", ""),
+                objective=status.get("objective"),
+            )
+        )
+
+
 def run_optuna_sweep(
     config: SweepConfig,
-    write_manifest: Any,
+    write_manifest_with_variants: Any,
+    build_variant: Any,
 ) -> tuple[int, TrialOutcomeTracker | None, list[TrialArtifacts]]:
     """Drive an Optuna study end-to-end.
 
     Returns ``(failures, tracker, artifacts)`` so the caller can write the
     final manifest summary and exit code in the same shape as the static
-    flow.
+    flow. Resume honors persistent storage: previously consumed slots in
+    ``study.trials`` are not re-asked, the manifest preserves earlier
+    variants, and the tracker is seeded from prior outcomes.
     """
     optuna = _import_optuna()
     strategy = config.strategy
@@ -114,16 +143,37 @@ def run_optuna_sweep(
 
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
 
+    previous_variants = _load_previous_variants(config) if config.resume else []
+    if config.resume and tracker is not None:
+        _seed_tracker_from_previous(tracker, previous_variants)
+
     artifacts: list[TrialArtifacts] = []
     failures = 0
+    already_consumed = len(study.trials) if config.resume else 0
 
-    for index in range(strategy.num_trials):
+    for index in range(already_consumed, strategy.num_trials):
+        if tracker is not None and tracker.halted:
+            break
+
         optuna_trial = study.ask()
         params = _suggest_parameters(optuna_trial, config.parameters)
         trial = _make_trial(index, params)
-        artifact = materialize_trial(config, trial)
+
+        try:
+            artifact = materialize_trial(config, trial)
+        except Exception as exc:
+            # Sampled parameters failed target-config validation. Mark the
+            # asked trial failed in Optuna so persistent storage doesn't
+            # leak a RUNNING slot, then continue per failure policy.
+            study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+            failures += 1
+            if not config.continue_on_failure:
+                raise SystemExit(1) from exc
+            print(f"Optuna trial {index:04d} failed materialization: {exc}")
+            continue
+
         artifacts.append(artifact)
-        write_manifest(config, artifacts)
+        write_manifest_with_variants(config, previous_variants + [build_variant(a) for a in artifacts])
 
         returncode = _run_with_retries(artifact, gpu_group, config.retry_budget)
         objective_value = (
@@ -147,6 +197,8 @@ def run_optuna_sweep(
             outcome = TrialOutcome(trial_id=trial.id, label=trial.label, objective=objective_value)
             if tracker.observe(outcome):
                 break
+
+    write_manifest_with_variants(config, previous_variants + [build_variant(a) for a in artifacts])
 
     return failures, tracker, artifacts
 
