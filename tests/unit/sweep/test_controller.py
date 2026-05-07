@@ -55,9 +55,11 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
 
     called = {}
 
-    def fake_local(artifacts, max_parallel):
+    def fake_local(artifacts, max_parallel, continue_on_failure, retry_budget):
         called["count"] = len(artifacts)
         called["max_parallel"] = max_parallel
+        called["continue_on_failure"] = continue_on_failure
+        called["retry_budget"] = retry_budget
 
     monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
 
@@ -70,4 +72,4 @@ def test_run_sweep_dispatches_local_scheduler(tmp_path: Path, monkeypatch) -> No
 
     run_sweep(config)
 
-    assert called == {"count": 1, "max_parallel": 1}
+    assert called == {"count": 1, "max_parallel": 1, "continue_on_failure": True, "retry_budget": 1}

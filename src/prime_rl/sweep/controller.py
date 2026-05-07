@@ -68,8 +68,18 @@ def run_sweep(config: SweepConfig) -> None:
         return
 
     if isinstance(config.scheduler, LocalSweepSchedulerConfig):
-        run_trials_locally(artifacts, max_parallel=config.scheduler.max_parallel)
+        run_trials_locally(
+            artifacts,
+            max_parallel=config.scheduler.max_parallel,
+            continue_on_failure=config.continue_on_failure,
+            retry_budget=config.retry_budget,
+        )
     elif isinstance(config.scheduler, SlurmSweepSchedulerConfig):
-        submit_trials_to_slurm(artifacts, max_parallel=config.scheduler.max_parallel)
+        submit_trials_to_slurm(
+            artifacts,
+            max_parallel=config.scheduler.max_parallel,
+            continue_on_failure=config.continue_on_failure,
+            retry_budget=config.retry_budget,
+        )
     else:
         raise ValueError(f"Unsupported sweep scheduler: {config.scheduler}")

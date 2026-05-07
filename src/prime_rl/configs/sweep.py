@@ -68,6 +68,14 @@ class SweepConfig(BaseConfig):
     scheduler: SweepSchedulerConfig = LocalSweepSchedulerConfig()
     parameters: dict[str, SweepParameterConfig]
     wandb: SweepWandbConfig | None = SweepWandbConfig()
+    continue_on_failure: Annotated[
+        bool,
+        Field(description="Schedule remaining trials when one fails. Set false to halt-on-first-fail."),
+    ] = True
+    retry_budget: Annotated[
+        int,
+        Field(ge=0, description="Retry a failed trial up to this many times before marking it failed."),
+    ] = 1
     dry_run: bool = False
     clean_output_dir: bool = False
 
