@@ -9,6 +9,7 @@ strategies in later phases.
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +22,18 @@ def _final_summary_paths(run_dir: Path) -> list[Path]:
 
 
 def _coerce_to_float(value: Any) -> float | None:
+    """Return ``value`` as a finite float, or ``None`` for anything else.
+
+    NaN / +Inf / -Inf are rejected because they break later improvement and
+    threshold comparisons (NaN compares False with everything, +/-Inf would
+    pin best forever) and ``json.dumps`` writes them as non-standard
+    ``NaN`` / ``Infinity`` tokens that other readers cannot parse.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        scalar = float(value)
+        return scalar if math.isfinite(scalar) else None
     return None
 
 

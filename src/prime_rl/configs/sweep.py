@@ -281,4 +281,9 @@ class SweepConfig(BaseConfig):
             raise ValueError(
                 "early_stopping requires an objective so the controller knows which metric to compare."
             )
+        if self.early_stopping is not None and isinstance(self.scheduler, SlurmSweepSchedulerConfig):
+            raise ValueError(
+                "early_stopping is not supported with the SLURM scheduler: the controller submits "
+                "jobs and exits, so it never observes trial completion to decide when to halt."
+            )
         return self

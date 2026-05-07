@@ -274,6 +274,18 @@ def test_early_stopping_requires_objective(tmp_path: Path) -> None:
         )
 
 
+def test_early_stopping_rejects_slurm_scheduler(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="early_stopping is not supported with the SLURM"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm"},
+            parameters={"optim.lr": {"values": [1e-5]}},
+            objective={"metric": "val/loss", "direction": "minimize"},
+            early_stopping={"type": "patience", "patience": 3},
+        )
+
+
 def test_early_stopping_threshold_parses(tmp_path: Path) -> None:
     config = SweepConfig(
         base=[tmp_path / "base.toml"],

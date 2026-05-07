@@ -38,3 +38,13 @@ def test_read_final_summary_returns_none_for_non_scalar(tmp_path: Path) -> None:
     assert read_final_summary(tmp_path, "val/loss") is None
     assert read_final_summary(tmp_path, "flag") is None
     assert read_final_summary(tmp_path, "missing.key") is None
+
+
+def test_read_final_summary_rejects_non_finite(tmp_path: Path) -> None:
+    summary_path = tmp_path / "run-x" / "final_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text('{"val/loss": NaN, "reward": Infinity, "neg": -Infinity, "ok": 1.5}')
+    assert read_final_summary(tmp_path, "val/loss") is None
+    assert read_final_summary(tmp_path, "reward") is None
+    assert read_final_summary(tmp_path, "neg") is None
+    assert read_final_summary(tmp_path, "ok") == 1.5

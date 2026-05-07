@@ -191,6 +191,115 @@ def test_run_sweep_resume_skips_completed_trials(tmp_path: Path, monkeypatch) ->
     assert json.loads(completed_status_path.read_text())["state"] == "completed"
 
 
+def test_run_sweep_resume_seeds_tracker_from_completed_trials(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    base_config_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    captured_completion = []
+
+    def fake_local(
+        artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None
+    ):
+        # First run: mark both trials completed with recorded objectives.
+        for value, artifact in zip([0.9, 0.7], artifacts):
+            status = json.loads(artifact.status_path.read_text())
+            status.update({"state": "completed", "returncode": 0, "objective": value})
+            artifact.status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
+
+    run_sweep(SweepConfig(**base_config_kwargs))
+
+    def fake_local_resume(
+        artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None
+    ):
+        captured_completion.append([artifact.trial.id for artifact in artifacts])
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local_resume)
+
+    run_sweep(SweepConfig(**base_config_kwargs, resume=True))
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    summary = manifest["summary"]
+    assert summary["completed"] == 2
+    assert summary["best_value"] == 0.9
+
+
+def test_run_sweep_resume_short_circuits_when_seeding_triggers_halt(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    base_config_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        early_stopping={"type": "threshold", "threshold": 0.5},
+        wandb=None,
+    )
+
+    def fake_local(
+        artifacts, max_parallel, gpu_groups, continue_on_failure, retry_budget, on_trial_complete=None
+    ):
+        for value, artifact in zip([0.9, 0.4], artifacts[:2]):
+            status = json.loads(artifact.status_path.read_text())
+            status.update({"state": "completed", "returncode": 0, "objective": value})
+            artifact.status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local)
+    run_sweep(SweepConfig(**base_config_kwargs))
+
+    invoked = []
+
+    def fake_local_resume(*args, **kwargs):
+        invoked.append(True)
+        return 0
+
+    monkeypatch.setattr("prime_rl.sweep.controller.run_trials_locally", fake_local_resume)
+    run_sweep(SweepConfig(**base_config_kwargs, resume=True))
+
+    assert invoked == []
+    summary = json.loads((tmp_path / "study" / "manifest.json").read_text())["summary"]
+    assert summary["halted_by_early_stopping"] is True
+    assert summary["halt_reason"] == "threshold"
+
+
+def test_run_sweep_skips_tracker_for_slurm_scheduler(tmp_path: Path, monkeypatch, capsys) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    monkeypatch.setattr("prime_rl.sweep.controller.submit_trials_to_slurm", lambda *args, **kwargs: 0)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm"},
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest.get("summary") is None
+    assert "objective tracking is only computed for the local scheduler" in capsys.readouterr().out
+
+
 def test_run_sweep_records_objective_and_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})

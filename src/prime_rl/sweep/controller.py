@@ -129,6 +129,25 @@ def _build_trial_callback(config: SweepConfig, tracker: TrialOutcomeTracker | No
     return on_trial_complete
 
 
+def _seed_tracker_from_resume(tracker: TrialOutcomeTracker, artifacts: list[TrialArtifacts]) -> None:
+    """Replay each completed trial's recorded objective into the tracker.
+
+    Without this the resumed scheduler skips already-completed trials, so the
+    tracker never sees them — the manifest summary would forget earlier work
+    and patience/threshold decisions would not account for completed trials.
+    """
+    for artifact in artifacts:
+        status = json.loads(artifact.status_path.read_text())
+        if status.get("state") != "completed":
+            continue
+        outcome = TrialOutcome(
+            trial_id=artifact.trial.id,
+            label=artifact.trial.label,
+            objective=status.get("objective"),
+        )
+        tracker.observe(outcome)
+
+
 def run_sweep(config: SweepConfig) -> None:
     artifacts = _materialize_study(config)
 
@@ -138,10 +157,22 @@ def run_sweep(config: SweepConfig) -> None:
             print(" ".join(artifact.command))
         return
 
-    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
+    track_objectives = config.objective is not None and isinstance(config.scheduler, LocalSweepSchedulerConfig)
+    if config.objective is not None and not track_objectives:
+        print(
+            "Note: objective tracking is only computed for the local scheduler; "
+            "SLURM trials run asynchronously after submission and produce their own status.json."
+        )
+    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if track_objectives else None
     on_trial_complete = _build_trial_callback(config, tracker)
 
-    if isinstance(config.scheduler, LocalSweepSchedulerConfig):
+    if tracker is not None and config.resume:
+        _seed_tracker_from_resume(tracker, artifacts)
+
+    failures = 0
+    if tracker is not None and tracker.halted:
+        print("Skipping new trials: early stopping already triggered by completed trials in the study.")
+    elif isinstance(config.scheduler, LocalSweepSchedulerConfig):
         gpu_groups = (
             config.scheduler.gpu_assignment.visible_devices if config.scheduler.gpu_assignment is not None else None
         )
