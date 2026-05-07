@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 from prime_rl.sweep.materialize import TrialArtifacts, write_json
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
@@ -31,6 +32,21 @@ def _metrics_jsonl_path(artifact: TrialArtifacts) -> str:
     return (artifact.run_dir / "metrics.jsonl").as_posix()
 
 
+def _reset_metrics_jsonl(artifact: TrialArtifacts) -> None:
+    """Truncate the sidecar metrics file before a fresh attempt.
+
+    FileMonitor opens in append mode, so without truncation a failed
+    attempt's later steps would survive into the retry. read_final_summary
+    selects the largest reported step, which would then return the failed
+    attempt's value instead of the successful retry's value. The pruning
+    loop has the same hazard: a stale row from a previous attempt can fire
+    should_prune() before the new attempt has reported anything.
+    """
+    path = Path(_metrics_jsonl_path(artifact))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+
+
 def _build_env(artifact: TrialArtifacts, gpu_group: list[int] | None) -> dict[str, str]:
     """Inherit the parent env, pin CUDA_VISIBLE_DEVICES, and route the trial's
     step-indexed metrics to the canonical sidecar file the sweep controller
@@ -54,6 +70,7 @@ def _run_with_retries(artifact: TrialArtifacts, gpu_group: list[int] | None, ret
     attempts = 0
     while True:
         attempts += 1
+        _reset_metrics_jsonl(artifact)
         _write_status(
             artifact,
             state="running",

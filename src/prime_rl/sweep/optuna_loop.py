@@ -49,7 +49,13 @@ from prime_rl.sweep.materialize import (
     record_trial_pruned,
 )
 from prime_rl.sweep.metrics import read_final_summary, read_intermediate_metric
-from prime_rl.sweep.schedulers import _build_env, _run_with_retries, _write_status, utc_now
+from prime_rl.sweep.schedulers import (
+    _build_env,
+    _reset_metrics_jsonl,
+    _run_with_retries,
+    _write_status,
+    utc_now,
+)
 from prime_rl.sweep.search import parameters_hash, trial_label
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -219,6 +225,7 @@ def _run_trial_with_pruning(
     trial actually fails (returncode != 0 and no prune signal).
     """
     env = _build_env(artifact, gpu_group)
+    _reset_metrics_jsonl(artifact)
     _write_status(
         artifact,
         state="running",
@@ -242,7 +249,10 @@ def _run_trial_with_pruning(
                 if last_reported_step is None or step > last_reported_step:
                     optuna_trial.report(value, step)
                     last_reported_step = step
-                    if optuna_trial.should_prune():
+                    # Only consider pruning while the trial is still running.
+                    # If the subprocess already exited, the run produced its
+                    # final objective and pruning would discard a valid value.
+                    if returncode is None and optuna_trial.should_prune():
                         _terminate_process_group(process)
                         record_trial_pruned(artifact.status_path, step, value)
                         return _PollingOutcome(

@@ -521,6 +521,119 @@ def test_run_trial_with_pruning_records_objective_on_clean_completion(tmp_path: 
     assert status["returncode"] == 0
 
 
+def test_run_trial_with_pruning_does_not_prune_after_subprocess_exit(tmp_path: Path, monkeypatch) -> None:
+    """Regression: a completed trial must not be re-classified as pruned even
+    if its final intermediate point would have triggered should_prune().
+
+    The polling loop reads the metric *after* process.wait() returns the real
+    return code; without the gate on returncode, a should_prune-eligible last
+    value would discard the valid final objective.
+    """
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-late", label="late", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    rows = [{"step": 1, "reward": 0.05}]
+
+    class _FakePopenAlreadyExited(_FakePopen):
+        """Returncode-on-first-wait variant: process is already done by the
+        time the polling loop gets to read its metric."""
+
+        def wait(self, timeout=None) -> int:
+            self._returncode = self._returncode_value
+            return self._returncode_value
+
+    def popen_factory(*args, **kwargs):
+        return _FakePopenAlreadyExited(*args, rows=rows, returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    terminated: list[bool] = []
+    _patch_terminate(monkeypatch, terminated)
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return True  # pruner WOULD prune, but we are past the natural exit
+
+    outcome = _run_trial_with_pruning(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.05
+    assert terminated == []  # never had to terminate
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+
+
+def test_run_with_retries_truncates_metrics_jsonl_between_attempts(tmp_path: Path, monkeypatch) -> None:
+    """Regression: if attempt 1 fails after writing higher steps than the
+    successful retry, the sidecar must be truncated between attempts so
+    read_final_summary returns the retry's value, not the failed run's."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.metrics import read_final_summary
+    from prime_rl.sweep.schedulers import _run_with_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-retry", label="retry", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    attempts = {"n": 0}
+
+    def fake_run(command, env=None, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            # Failed attempt wrote higher-step bad value before crashing.
+            metrics_path.write_text(json.dumps({"step": 50, "reward": 0.01}) + "\n")
+            return SimpleNamespace(returncode=1)
+        # Successful retry writes a lower-step good value. Without truncation,
+        # read_final_summary would see step=50 reward=0.01 from the failed run
+        # and report that instead of step=10 reward=0.9.
+        existing = metrics_path.read_text() if metrics_path.exists() else ""
+        metrics_path.write_text(existing + json.dumps({"step": 10, "reward": 0.9}) + "\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    returncode = _run_with_retries(artifact, gpu_group=None, retry_budget=1)
+
+    assert returncode == 0
+    assert attempts["n"] == 2
+    # Truncation between attempts must wipe the failed run's row before the
+    # successful retry writes its own line.
+    assert read_final_summary(artifact.run_dir, "reward") == 0.9
+
+
 def test_optuna_sweep_with_median_pruner_runs_to_completion(tmp_path: Path, monkeypatch) -> None:
     """End-to-end: sweep with median pruner enabled runs through the pruning
     code path. Trials with monotonically-improving metrics should not be
