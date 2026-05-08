@@ -1,17 +1,24 @@
-"""Wave-mode Optuna driver for the multi_run_lora scheduler (Phase 7b).
+"""Continuous-flow Optuna driver for the multi_run_lora scheduler (Phase 7c).
 
 The full multi-run + Optuna stack exercises trainer + inference + N
-orchestrators in one ``rl-multi-run`` invocation per wave; here we stub
-``validate_target_config`` for the resolved orchestrator config and
-``subprocess.Popen`` for the launcher invocation, plus replace the Optuna
-study with a controllable stub. The contract under test is:
+orchestrators in one ``rl-multi-run --watch-slots`` invocation that lives
+across the whole sweep; here we stub ``validate_target_config`` for the
+resolved orchestrator config and ``subprocess.Popen`` for the launcher
+invocation, plus replace the Optuna study with a controllable stub. The
+contract under test is:
 
-- One ``rl-multi-run`` invocation per wave, sized to ``max_concurrent_runs``.
-- Mid-wave pruning writes ``<run_dir>/control/evicted.txt`` and records
-  ``state="pruned"`` in ``status.json`` *before* the orchestrator exits.
-- After each wave, ``study.tell`` is called with the right state per trial:
-  PRUNED for pruned trials, the recovered objective for completed trials,
-  FAIL for trials whose orchestrator exited non-zero.
+- One ``rl-multi-run`` invocation for the entire sweep (vs one-per-wave
+  in 7b).
+- The controller maintains target concurrency = ``max_concurrent_runs``,
+  asking Optuna for replacements as slots free.
+- Mid-flight pruning still writes ``<run_dir>/control/evicted.txt`` and
+  records ``state="pruned"`` in ``status.json`` before the orchestrator
+  exits.
+- ``study.tell`` is called with the right state per trial: PRUNED for
+  pruned trials, the recovered objective for completed trials, FAIL for
+  trials whose orchestrator exited non-zero.
+- When all trials are settled the controller writes
+  ``<shared_dir>/control/done`` and the launcher tears down.
 """
 
 from __future__ import annotations
@@ -116,15 +123,19 @@ class _StudyStub:
 
 
 class _FakePopen:
-    """Fake ``subprocess.Popen`` that simulates a wave's ``rl-multi-run`` run.
+    """Fake ``subprocess.Popen`` that simulates ``rl-multi-run --watch-slots``.
 
-    On construction it parses ``--runs-dir`` from the command and seeds each
-    run dir's ``metrics.jsonl`` with a single ``(step=1, reward=...)`` row so
-    the wave driver's poll loop has something to ``report`` on its first
-    tick. ``poll()`` returns ``None`` for the first call (the poll loop runs
-    once) and ``0`` thereafter; on the transition it writes
-    ``<run_dir>/control/exit_code`` for every survivor, mirroring what the
-    real launcher does in production.
+    Continuous-flow mode runs one launcher across the lifetime of the whole
+    sweep. The fake mirrors that: on each ``poll()`` call it scans the parent
+    of its initial ``--runs-dir`` for ``run_*/control/orch.toml`` files,
+    seeds ``metrics.jsonl``, and writes ``control/exit_code`` for every newly
+    discovered run dir (``"1\n"`` if the controller pre-marked the trial as
+    pruned, else ``"0\n"``). ``poll()`` returns ``None`` until the controller
+    drops ``<shared_dir>/control/done``, then ``0``.
+
+    The first poll only "discovers" the initial run dirs from
+    ``--runs-dir``; subsequent polls pick up dirs the controller materialized
+    after the launcher started, which is how we exercise slot replacement.
 
     Non-``rl-multi-run`` invocations (e.g. ``git rev-parse`` for the manifest's
     git metadata) are delegated to the real ``subprocess.Popen`` — patching
@@ -149,38 +160,49 @@ class _FakePopen:
         self.command = list(command)
         idx = command.index("--runs-dir")
         self.run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        self._poll_count = 0
+        self.shared_dir = self.run_dirs[0].parent
+        self.watch_slots = "--watch-slots" in command
+        self.seen_run_ids: set[str] = set()
         self.returncode: int | None = None
 
-        # Seed metrics so the wave driver has something to report on the
-        # first poll tick. Reward 0.5 is arbitrary; the prune decision in
-        # tests comes from the trial stub's should_prune flag, not the value.
-        for run_dir in self.run_dirs:
+    def _process_run_dirs(self) -> None:
+        """Seed metrics + exit_code for any new run_*/control/orch.toml dirs."""
+        for run_dir in sorted(self.shared_dir.glob("run_*")):
+            if run_dir.name in self.seen_run_ids:
+                continue
+            if not (run_dir / "control" / "orch.toml").exists():
+                continue
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "metrics.jsonl").write_text(
                 json.dumps({"step": 1, "reward": 0.5}) + "\n"
             )
-
-    def poll(self) -> int | None:
-        self._poll_count += 1
-        if self._poll_count == 1:
-            return None
-        # On the second poll, simulate the launcher writing exit_codes and
-        # exiting cleanly. Pruned trials had their orch exit with non-zero
-        # in production; the controller pre-marked them so reconcile won't
-        # read the exit_code anyway, but we still write 1 for diagnostics.
-        for run_dir in self.run_dirs:
             (run_dir / "control").mkdir(parents=True, exist_ok=True)
             status_path = run_dir / "status.json"
             status = json.loads(status_path.read_text()) if status_path.exists() else {}
             code = "1\n" if status.get("state") == "pruned" else "0\n"
             (run_dir / "control" / "exit_code").write_text(code)
+            self.seen_run_ids.add(run_dir.name)
+
+    def poll(self) -> int | None:
+        self._process_run_dirs()
+        if self.watch_slots:
+            done_marker = self.shared_dir / "control" / "done"
+            if done_marker.exists():
+                self.returncode = 0
+                return 0
+            return None
+        # Wave-mode fallback (any caller that hasn't migrated yet): one poll
+        # tick of work, then exit cleanly.
         self.returncode = 0
         return 0
 
     def wait(self) -> int:
+        # If the loop never managed to write done (e.g. tracker.halted before
+        # all trials were submitted), this would hang in production. The
+        # fake settles immediately so the test exits.
         if self.returncode is None:
-            self.poll()
+            self._process_run_dirs()
+            self.returncode = 0
         return self.returncode  # type: ignore[return-value]
 
 
@@ -281,9 +303,15 @@ def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
     assert states_by_index == {0: "completed", 1: "pruned", 2: "completed"}
 
 
-def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
-    """``num_trials=4, max_concurrent_runs=2`` produces two waves of two
-    trials each; each wave is one Popen invocation."""
+def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None:
+    """``num_trials=4, max_concurrent_runs=2``: one launcher, four trials.
+
+    Phase 7c: continuous-flow replaces wave-mode. The controller spawns
+    ``rl-multi-run`` once with ``max_concurrent_runs`` initial run dirs
+    and feeds replacements into the launcher's slot-watch loop as slots
+    free, so we expect exactly one Popen invocation regardless of
+    ``num_trials``.
+    """
     shared_path = tmp_path / "shared.toml"
     write_toml(shared_path, {})
 
@@ -293,7 +321,7 @@ def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
     _install_fake_optuna_runtime(monkeypatch, study)
 
     config = SweepConfig(
-        name="lora-optuna-waves",
+        name="lora-optuna-continuous",
         entrypoint="rl",
         base=[shared_path],
         output_dir=tmp_path / "study",
@@ -310,15 +338,25 @@ def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
 
     run_sweep(config)
 
-    assert len(_FakePopen.instances) == 2
-    for invocation in _FakePopen.instances:
-        runs_idx = invocation.command.index("--runs-dir")
-        run_dirs = invocation.command[runs_idx + 1].split(":")
-        assert len(run_dirs) == 2
+    # Single launcher for the whole sweep.
+    assert len(_FakePopen.instances) == 1
+    invocation = _FakePopen.instances[0]
+    runs_idx = invocation.command.index("--runs-dir")
+    initial_run_dirs = invocation.command[runs_idx + 1].split(":")
+    # Initial cohort sized to max_concurrent_runs.
+    assert len(initial_run_dirs) == 2
+    assert "--watch-slots" in invocation.command
+
+    # The controller must drop the done marker so the launcher tears down.
+    shared_dir = tmp_path / "study" / "shared"
+    assert (shared_dir / "control" / "done").exists()
+
+    # All 4 trials get materialized as run_* dirs under the shared dir.
+    materialized = sorted(p.name for p in shared_dir.glob("run_*"))
+    assert len(materialized) == 4
 
     assert len(study.asked) == 4
     assert len(study.tells) == 4
-    # Every tell carries the wave's objective value (0.5 by fake convention).
     for _trial, value, state in study.tells:
         assert state is None
         assert value == 0.5

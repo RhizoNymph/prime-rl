@@ -129,19 +129,31 @@ def _materialize_multi_run_study(config: SweepConfig) -> list[TrialArtifacts]:
     """Materialize all trials as ``run_*`` subdirs under a shared trainer dir.
 
     Multi-run sweeps invoke ``rl-multi-run`` exactly once with all trials
-    laid out up front. Resume against a still-running shared trainer is a
-    Phase 7b concern, so this path always writes from scratch.
+    laid out up front. ``--resume`` (Phase 7c) preserves the per-trial
+    artifacts of completed/pruned/failed trials and only re-prepares the
+    pending ones; live-attach against a still-running trainer is still 7d+.
     """
     if config.output_dir.exists() and config.clean_output_dir:
         shutil.rmtree(config.output_dir)
     config.output_dir.mkdir(parents=True, exist_ok=True)
     multi_run_shared_dir(config).mkdir(parents=True, exist_ok=True)
 
+    expected = _previous_checksums(config) if config.resume else {}
+
     _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
 
     trials = _expand_trials(config)
     assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
-    artifacts = [materialize_multi_run_trial(config, trial, config.scheduler) for trial in trials]
+    artifacts = [
+        materialize_multi_run_trial(
+            config,
+            trial,
+            config.scheduler,
+            resume=config.resume,
+            expected_checksums=expected.get(trial.id),
+        )
+        for trial in trials
+    ]
     _write_manifest(config, artifacts)
     return artifacts
 
@@ -214,7 +226,13 @@ def _run_optuna(config: SweepConfig) -> None:
 
 
 def _run_multi_run_static(config: SweepConfig) -> None:
-    """Drive a static (grid/random) shared-trainer LoRA sweep through ``rl-multi-run``."""
+    """Drive a static (grid/random) shared-trainer LoRA sweep through ``rl-multi-run``.
+
+    On ``--resume``, trials whose prior status was completed/pruned/failed are
+    kept verbatim — Optuna already heard about them (or, for static, they're
+    already in the manifest summary). Only ``state == "pending"`` artifacts go
+    into the next ``rl-multi-run`` invocation.
+    """
     assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
     artifacts = _materialize_multi_run_study(config)
 
@@ -227,19 +245,30 @@ def _run_multi_run_static(config: SweepConfig) -> None:
             print(f"  {artifact.run_dir}")
         return
 
-    if len(artifacts) > config.scheduler.max_concurrent_runs:
+    pending = [
+        artifact
+        for artifact in artifacts
+        if json.loads(artifact.status_path.read_text()).get("state") == "pending"
+    ]
+
+    if len(pending) > config.scheduler.max_concurrent_runs:
         raise SystemExit(
             f"multi_run_lora scheduler.max_concurrent_runs={config.scheduler.max_concurrent_runs} "
-            f"but the search expanded to {len(artifacts)} trials. Increase max_concurrent_runs "
-            "or shrink the search space; wave-based execution requires Optuna (Phase 7b)."
+            f"but {len(pending)} trial(s) need to launch. Increase max_concurrent_runs or shrink "
+            "the search space; wave-based execution requires Optuna (Phase 7b)."
         )
 
-    failures = submit_trials_to_multi_run_lora(
-        artifacts,
-        shared_paths=config.scheduler.shared,
-        shared_dir=multi_run_shared_dir(config),
-        continue_on_failure=config.continue_on_failure,
-    )
+    if pending:
+        failures = submit_trials_to_multi_run_lora(
+            pending,
+            shared_paths=config.scheduler.shared,
+            shared_dir=multi_run_shared_dir(config),
+            continue_on_failure=config.continue_on_failure,
+        )
+    else:
+        failures = 0
+        if config.resume:
+            print(f"Resume: every trial already terminal, no new work to launch.")
 
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
     if config.objective is not None and tracker is not None:
@@ -250,7 +279,13 @@ def _run_multi_run_static(config: SweepConfig) -> None:
             # for the others keeps status.json's shape consistent.
             status = json.loads(artifact.status_path.read_text())
             if status.get("state") == "completed":
-                objective = read_final_summary(artifact.run_dir, config.objective.metric)
+                # Preserved completed trials carry their authoritative
+                # objective in status.json from the prior run; reuse it
+                # rather than re-reading metrics.jsonl in case the sidecar
+                # was archived between runs.
+                objective = status.get("objective")
+                if objective is None:
+                    objective = read_final_summary(artifact.run_dir, config.objective.metric)
             else:
                 objective = None
             record_trial_objective(artifact.status_path, objective)

@@ -467,12 +467,6 @@ class SweepConfig(BaseConfig):
                     "multi_run_lora scheduler is RL-only; the shared-trainer architecture "
                     "depends on the trainer's MultiRunManager which only the rl entrypoint runs."
                 )
-            if self.resume:
-                raise ValueError(
-                    "Resume is not supported with the multi_run_lora scheduler in Phase 7a; "
-                    "re-attaching to a still-running shared trainer needs reconciliation work "
-                    "that lands in Phase 7b."
-                )
             offending = [
                 path
                 for path in self.parameters
