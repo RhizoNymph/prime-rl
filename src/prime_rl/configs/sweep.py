@@ -300,12 +300,12 @@ MULTI_RUN_LORA_PARAMETER_PREFIXES: tuple[str, ...] = (
 class MultiRunLoRASchedulerConfig(BaseConfig):
     """Run all trials concurrently against one shared trainer + inference.
 
-    Phase 7a: launches a single ``rl-multi-run`` invocation that brings up
+    Static sweeps launch a single ``rl-multi-run`` invocation that brings up
     one trainer (with ``trainer.max_concurrent_runs >= num_trials``), one
     inference server, and ``num_trials`` orchestrators — one per trial.
-    Each orchestrator runs its own RL loop against its own LoRA adapter
-    inside the shared trainer. Pruning and resume against a still-running
-    trainer are deferred to Phase 7b.
+    Optuna sweeps run in waves so in-flight trials can be pruned between
+    intermediate metric reports. Resume can reattach to an existing shared
+    trainer state and continue pending trials.
     """
 
     type: Literal["multi_run_lora"] = "multi_run_lora"
