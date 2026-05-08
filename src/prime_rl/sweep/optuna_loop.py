@@ -167,6 +167,7 @@ class _PollingOutcome:
     objective: float | None
     pruned_at_step: int | None = None
     pruned_value: float | None = None
+    reports_sent: int = 0
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: float = 10.0) -> None:
@@ -235,6 +236,7 @@ def _run_trial_with_pruning(
     )
     process = subprocess.Popen(artifact.command, env=env, start_new_session=True)
     last_reported_step: int | None = None
+    reports_sent = 0
 
     try:
         while True:
@@ -249,6 +251,7 @@ def _run_trial_with_pruning(
                 if last_reported_step is None or step > last_reported_step:
                     optuna_trial.report(value, step)
                     last_reported_step = step
+                    reports_sent += 1
                     # Only consider pruning while the trial is still running.
                     # If the subprocess already exited, the run produced its
                     # final objective and pruning would discard a valid value.
@@ -261,6 +264,7 @@ def _run_trial_with_pruning(
                             objective=None,
                             pruned_at_step=step,
                             pruned_value=value,
+                            reports_sent=reports_sent,
                         )
 
             if returncode is not None:
@@ -273,10 +277,14 @@ def _run_trial_with_pruning(
     if returncode == 0:
         objective = read_final_summary(artifact.run_dir, metric)
         _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
-        return _PollingOutcome(state="completed", returncode=0, objective=objective)
+        return _PollingOutcome(
+            state="completed", returncode=0, objective=objective, reports_sent=reports_sent
+        )
 
     _write_status(artifact, state="failed", finished_at=utc_now(), returncode=returncode)
-    return _PollingOutcome(state="failed", returncode=returncode, objective=None)
+    return _PollingOutcome(
+        state="failed", returncode=returncode, objective=None, reports_sent=reports_sent
+    )
 
 
 def _run_trial_with_pruning_and_retries(
@@ -292,12 +300,23 @@ def _run_trial_with_pruning_and_retries(
     Pruned and completed outcomes return immediately. Only ``failed``
     outcomes (subprocess returncode != 0 with no prune signal) are retried,
     so a deliberately stopped trial is never resurrected.
+
+    A subtle constraint: ``optuna_trial.report`` calls accumulate on the
+    Optuna trial object across retries. If the failed attempt already
+    reported intermediate values, those values stay on the trial and will
+    bias the pruner's decisions during the retry (and Optuna may also
+    silently drop duplicate-step reports). We therefore refuse to retry
+    once any reports have been sent — the trial fails outright instead.
     """
     attempts = 0
     while True:
         attempts += 1
         outcome = _run_trial_with_pruning(artifact, gpu_group, optuna_trial, metric, poll_interval)
         if outcome.state in ("completed", "pruned"):
+            return outcome
+        if outcome.reports_sent > 0:
+            # Stale intermediate reports would bias the retry; surface the
+            # failure and let the caller record TrialState.FAIL.
             return outcome
         if attempts > retry_budget:
             return outcome
@@ -352,6 +371,10 @@ def _reconcile_running_trials(optuna: Any, study: Any, previous_variants: list[d
 
     - if the matching sweep status.json shows ``completed`` with a finite
       objective, tell Optuna the value so adaptive sampling can use it;
+    - if status.json shows ``pruned``, tell ``TrialState.PRUNED`` so the
+      sampler treats the slot as a deliberate stop (a crash between
+      ``record_trial_pruned`` and ``study.tell(PRUNED)`` would otherwise
+      misclassify it as a failure);
     - otherwise tell ``TrialState.FAIL`` so the slot stops blocking.
 
     Returns the number of trials reconciled, mostly for tests / logging.
@@ -361,14 +384,17 @@ def _reconcile_running_trials(optuna: Any, study: Any, previous_variants: list[d
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
         status = _variant_status_for_trial_number(previous_variants, trial.number)
+        recorded_state = status.get("state") if status is not None else None
         objective: float | None = None
-        if status is not None and status.get("state") == "completed":
-            value = status.get("objective")
+        if recorded_state == "completed":
+            value = status.get("objective") if status is not None else None
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 objective = float(value)
         # study.tell() accepts a trial number or a Trial; FrozenTrial is not
         # accepted, so pass trial.number.
-        if objective is not None:
+        if recorded_state == "pruned":
+            study.tell(trial.number, state=optuna.trial.TrialState.PRUNED)
+        elif objective is not None:
             study.tell(trial.number, objective)
         else:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)

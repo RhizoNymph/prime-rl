@@ -310,6 +310,86 @@ def test_optuna_resume_reconciles_running_trial_with_no_recorded_objective(
     assert sum(1 for s in states if s == optuna.trial.TrialState.COMPLETE) == 1
 
 
+def test_optuna_resume_reconciles_pruned_trial_as_pruned_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: a controller crash between record_trial_pruned() and
+    study.tell(PRUNED) leaves the Optuna trial RUNNING in storage even
+    though its sweep status.json reads ``state="pruned"``. Resume must
+    reconcile that as TrialState.PRUNED, not the FAIL fallback."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.6, 0.5])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    initial = SweepConfig(**base_kwargs)
+    initial.strategy.num_trials = 1
+    run_sweep(initial)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+
+    # Simulate the crash window: ask leaks a RUNNING trial, and the sweep's
+    # status.json for that trial records the prune decision the controller
+    # never got to tell Optuna.
+    pending = study.ask()
+    pending_index = pending.number
+    pending_id = f"{pending_index:04d}-pruned"
+    trial_dir = tmp_path / "study" / "trials" / pending_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trial_dir / "status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "state": "pruned",
+                "objective": None,
+                "pruned_at_step": 5,
+                "pruned_value": 0.01,
+            }
+        )
+    )
+
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"].append(
+        {
+            "id": pending_id,
+            "label": pending_id,
+            "status_path": status_path.as_posix(),
+            "output_dir": (trial_dir / "run").as_posix(),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    states = [t.state for t in study.trials]
+    assert optuna.trial.TrialState.RUNNING not in states
+    # Crucial: the orphan with status="pruned" must come back as PRUNED, not
+    # FAIL, so the sampler's history correctly reflects deliberate stops.
+    assert optuna.trial.TrialState.PRUNED in states
+    assert optuna.trial.TrialState.FAIL not in states
+
+
 def test_optuna_sweep_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
@@ -582,6 +662,64 @@ def test_run_trial_with_pruning_does_not_prune_after_subprocess_exit(tmp_path: P
     assert terminated == []  # never had to terminate
     status = json.loads(artifact.status_path.read_text())
     assert status["state"] == "completed"
+
+
+def test_run_trial_with_pruning_skips_retry_after_intermediate_reports(tmp_path: Path, monkeypatch) -> None:
+    """Regression: a failed attempt that already called optuna_trial.report
+    must not be retried within the same Optuna trial. Retries on the same
+    trial inherit the failed attempt's intermediate values, biasing pruning
+    decisions and silently dropping duplicate-step reports."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning_and_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-noretry", label="noretry", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    rows = [{"step": 1, "reward": 0.05}]
+    spawned = {"n": 0}
+
+    def popen_factory(*args, **kwargs):
+        spawned["n"] += 1
+        # Returncode 1 => failed attempt.
+        return _FakePopen(*args, rows=rows, returncode=1, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    _patch_terminate(monkeypatch, [])
+
+    reports: list[tuple[int, float]] = []
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            reports.append((step, value))
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_and_retries(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+        retry_budget=3,  # high budget on purpose; the early-exit must override
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.reports_sent == 1
+    # Crucial assertion: only one Popen, despite retry_budget=3, because the
+    # first attempt already sent intermediate reports.
+    assert spawned["n"] == 1
+    assert reports == [(1, 0.05)]
 
 
 def test_run_with_retries_truncates_metrics_jsonl_between_attempts(tmp_path: Path, monkeypatch) -> None:
