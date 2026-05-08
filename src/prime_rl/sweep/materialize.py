@@ -263,3 +263,116 @@ def materialize_trial(
         resolved_checksum=resolved_checksum,
         base_checksums=base_checksums,
     )
+
+
+def _merge_multi_run_wandb_overrides(
+    config: SweepConfig, flat_overrides: dict[str, Any], trial: Trial
+) -> None:
+    """Tag the per-run orchestrator's W&B run with sweep + trial metadata."""
+    if config.wandb is None or not config.wandb.enabled:
+        return
+
+    group = config.wandb.group or config.name
+    if group is not None:
+        flat_overrides["orchestrator.wandb.group"] = group
+
+    flat_overrides["orchestrator.wandb.name"] = trial.label or trial.id
+
+    tags = list(dict.fromkeys([*config.wandb.tags, "sweep", f"trial:{trial.id}"]))
+    if config.name is not None:
+        tags.append(f"study:{config.name}")
+    flat_overrides["orchestrator.wandb.tags"] = list(dict.fromkeys(tags))
+
+
+def multi_run_shared_dir(config: SweepConfig) -> Path:
+    """Directory that hosts the shared trainer's output and per-run subdirs.
+
+    The trainer's ``MultiRunManager`` scans ``<dir>/run_*`` so every trial
+    directory must sit directly under this path with a ``run_`` prefix.
+    """
+    return config.output_dir / "shared"
+
+
+def multi_run_trial_dir(config: SweepConfig, trial: Trial) -> Path:
+    """Per-trial directory the trainer will discover as a ``run_*`` slot."""
+    return multi_run_shared_dir(config) / f"run_{trial.id}"
+
+
+def materialize_multi_run_trial(
+    config: SweepConfig,
+    trial: Trial,
+    scheduler: Any,  # MultiRunLoRASchedulerConfig — typed as Any to avoid an import cycle
+) -> TrialArtifacts:
+    """Write a per-trial ``run_<id>/control/orch.toml`` for a shared-trainer sweep.
+
+    The shared base TOMLs in ``scheduler.shared`` resolve to a full RLConfig.
+    Per-trial parameter overrides (already prefixed with ``orchestrator.``)
+    are layered on top, the orchestrator block is extracted, and its TOML is
+    written where the trainer's ``MultiRunManager`` will find it. Returned
+    ``TrialArtifacts.run_dir`` points at the per-trial directory so the
+    sweep's existing metrics readers (``read_final_summary`` /
+    ``read_intermediate_metric``) keep working unchanged once the
+    orchestrator's ``FileMonitor`` writes ``metrics.jsonl`` there.
+    """
+    run_dir = multi_run_trial_dir(config, trial)
+    control_dir = run_dir / "control"
+    overrides_path = run_dir / "overrides.toml"
+    resolved_path = run_dir / "resolved.toml"
+    command_path = run_dir / "command.txt"
+    status_path = run_dir / "status.json"
+    orch_config_path = control_dir / "orch.toml"
+
+    # Trial overrides already use orchestrator.* paths thanks to the
+    # validator's allowlist. Add the per-run output_dir + W&B identity.
+    flat_overrides: dict[str, Any] = dict(trial.parameters)
+    flat_overrides["orchestrator.output_dir"] = run_dir.as_posix()
+    _merge_multi_run_wandb_overrides(config, flat_overrides, trial)
+
+    overrides = build_nested_overrides(flat_overrides)
+    write_toml(overrides_path, overrides)
+
+    # Resolve the full RLConfig with the shared base + trial overrides; the
+    # orchestrator block is what we ship to the trainer.
+    args: list[str] = []
+    for base_path in scheduler.shared:
+        args.extend(["@", base_path.as_posix()])
+    args.extend(["@", overrides_path.as_posix()])
+
+    resolved_rl_config = validate_target_config("rl", args)
+    orchestrator_dict = resolved_rl_config.orchestrator.model_dump(exclude_none=True, mode="json")
+
+    write_toml(resolved_path, orchestrator_dict)
+    write_toml(orch_config_path, orchestrator_dict)
+
+    command = ["rl-multi-run", "@", *(p.as_posix() for p in scheduler.shared), f"--run={run_dir.as_posix()}"]
+    command_path.write_text(" ".join(command) + "\n")
+
+    resolved_checksum = file_checksum(resolved_path)
+    base_checksums = {base.as_posix(): file_checksum(base) for base in scheduler.shared}
+
+    write_json(
+        status_path,
+        {
+            "id": trial.id,
+            "label": trial.label,
+            "state": "pending",
+            "pid": None,
+            "slurm_job_id": None,
+            "gpu_group": None,
+            "returncode": None,
+            "objective": None,
+        },
+    )
+
+    return TrialArtifacts(
+        trial=trial,
+        trial_dir=run_dir,
+        run_dir=run_dir,
+        overrides_path=overrides_path,
+        resolved_path=resolved_path,
+        command_path=command_path,
+        status_path=status_path,
+        command=command,
+        resolved_checksum=resolved_checksum,
+        base_checksums=base_checksums,
+    )

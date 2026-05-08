@@ -995,14 +995,47 @@ scheduler and validator are designed against a generic "per-run parameter set"
 interface so future trainer architectures can plug in without rewriting the
 scheduler.
 
-Add:
+Phase 7a (this branch):
 
-- `multi_run_lora` scheduler.
-- Allowlist validation for per-run safe parameters (swappable strategy, not
-  hard-coded LoRA fields).
-- Generation of `run_* / control/orch.toml` directories.
-- Shared trainer/inference launcher behavior.
-- Run-level pruning through existing eviction semantics where possible.
+- ``MultiRunLoRASchedulerConfig`` (``type = "multi_run_lora"``) with
+  ``max_concurrent_runs`` + ``shared`` (RLConfig base TOML(s) describing
+  the shared trainer + inference). Cross-field validation rejects
+  ``entrypoint != "rl"``, ``resume``, Optuna pairing (deferred to 7b),
+  and any parameter path outside the per-run-safe allowlist:
+  ``orchestrator.optim.*``, ``orchestrator.model.lora.*`` (subject to
+  trainer max-rank validation), ``orchestrator.sampling.*``,
+  ``orchestrator.environment.*``, ``orchestrator.batch.*``,
+  ``orchestrator.buffer.*``, ``orchestrator.eval.*``.
+- New ``rl-multi-run`` entrypoint launches one trainer + one inference +
+  N orchestrators against pre-materialized ``run_*`` directories.
+  Reuses the launch helpers extracted out of ``rl_local`` into
+  ``src/prime_rl/entrypoints/launch.py``. Each orchestrator runs in its
+  own subprocess with ``WANDB_SHARED_LABEL=orchestrator-<run_id>`` and
+  ``PRIME_RL_SWEEP_METRICS_JSONL=<run_dir>/metrics.jsonl`` so per-trial
+  metrics land in distinct sidecar files.
+- ``materialize_multi_run_trial`` writes
+  ``<study>/shared/run_<trial_id>/control/orch.toml`` plus the standard
+  per-trial artifacts (overrides.toml, resolved.toml, status.json) so
+  the trainer's ``MultiRunManager`` discovers each trial as a run slot
+  and the sweep's existing manifest helpers can describe the layout.
+- ``submit_trials_to_multi_run_lora`` invokes ``rl-multi-run`` exactly
+  once per sweep, pinning the trainer's ``output_dir`` to the shared
+  root via an override TOML. After completion the controller walks each
+  run dir's ``metrics.jsonl`` (Phase 5b's canonical source) to record
+  per-trial objectives.
+
+Deferred to Phase 7b:
+
+- Run-level pruning through ``control/evicted.txt`` (instead of the
+  Phase 5b SIGTERM-based prune path).
+- Retry semantics when one of N orchestrators fails (Phase 7a marks
+  every trial failed when the aggregate ``rl-multi-run`` invocation
+  exits non-zero, since per-orchestrator status reconciliation needs
+  trainer-side coordination).
+- Resume against a still-running shared trainer (rejected at config
+  validation time in 7a).
+- Optuna with ``multi_run_lora`` (mid-flight pruning needs trainer
+  eviction support).
 
 ### Phase 8: SLURM Arrays
 

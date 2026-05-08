@@ -280,8 +280,59 @@ class SlurmSweepSchedulerConfig(BaseConfig):
     type: Literal["slurm"] = "slurm"
 
 
+# Parameter paths a multi_run_lora sweep is allowed to vary. Must stay in
+# sync with what the trainer's MultiRunManager treats as per-run-safe; see
+# src/prime_rl/trainer/runs.py for the runtime validation hook. Anything
+# under trainer.*, model.*, deployment.*, or inference.* is shared across
+# runs and would silently mismatch between trials, so it is rejected at
+# config-load time.
+MULTI_RUN_LORA_PARAMETER_PREFIXES: tuple[str, ...] = (
+    "orchestrator.optim.",
+    "orchestrator.model.lora.",
+    "orchestrator.sampling.",
+    "orchestrator.environment.",
+    "orchestrator.batch.",
+    "orchestrator.buffer.",
+    "orchestrator.eval.",
+)
+
+
+class MultiRunLoRASchedulerConfig(BaseConfig):
+    """Run all trials concurrently against one shared trainer + inference.
+
+    Phase 7a: launches a single ``rl-multi-run`` invocation that brings up
+    one trainer (with ``trainer.max_concurrent_runs >= num_trials``), one
+    inference server, and ``num_trials`` orchestrators — one per trial.
+    Each orchestrator runs its own RL loop against its own LoRA adapter
+    inside the shared trainer. Pruning and resume against a still-running
+    trainer are deferred to Phase 7b.
+    """
+
+    type: Literal["multi_run_lora"] = "multi_run_lora"
+    max_concurrent_runs: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of concurrent orchestrator runs against the shared trainer. "
+                "Must match (or be <=) trainer.max_concurrent_runs in the shared base config."
+            ),
+        ),
+    ]
+    shared: Annotated[
+        list[Path],
+        Field(
+            min_length=1,
+            description=(
+                "RLConfig base TOML(s) describing the shared trainer + inference. "
+                "Trial overrides apply to the orchestrator block only."
+            ),
+        ),
+    ]
+
+
 SweepSchedulerConfig: TypeAlias = Annotated[
-    LocalSweepSchedulerConfig | SlurmSweepSchedulerConfig,
+    LocalSweepSchedulerConfig | SlurmSweepSchedulerConfig | MultiRunLoRASchedulerConfig,
     Field(discriminator="type"),
 ]
 
@@ -409,5 +460,35 @@ class SweepConfig(BaseConfig):
                 raise ValueError(
                     "Resume with the Optuna strategy requires strategy.storage so the study "
                     "can be reloaded; in-memory studies vanish when the controller exits."
+                )
+            if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
+                raise ValueError(
+                    "Optuna strategy is not supported with the multi_run_lora scheduler in "
+                    "Phase 7a. Pruning a single run mid-flight needs trainer-side eviction "
+                    "support that lands in Phase 7b."
+                )
+        if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
+            if self.entrypoint != "rl":
+                raise ValueError(
+                    "multi_run_lora scheduler is RL-only; the shared-trainer architecture "
+                    "depends on the trainer's MultiRunManager which only the rl entrypoint runs."
+                )
+            if self.resume:
+                raise ValueError(
+                    "Resume is not supported with the multi_run_lora scheduler in Phase 7a; "
+                    "re-attaching to a still-running shared trainer needs reconciliation work "
+                    "that lands in Phase 7b."
+                )
+            offending = [
+                path
+                for path in self.parameters
+                if not any(path.startswith(prefix) for prefix in MULTI_RUN_LORA_PARAMETER_PREFIXES)
+            ]
+            if offending:
+                allowed = ", ".join(MULTI_RUN_LORA_PARAMETER_PREFIXES)
+                raise ValueError(
+                    "multi_run_lora sweeps may only vary per-run orchestrator fields. "
+                    f"These parameter paths are not in the allowlist ({allowed}): {offending}. "
+                    "Trainer/model/deployment/inference settings cannot vary inside one shared trainer."
                 )
         return self

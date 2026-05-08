@@ -9,17 +9,29 @@ import tomli_w
 from prime_rl.configs.sweep import (
     GridStrategyConfig,
     LocalSweepSchedulerConfig,
+    MultiRunLoRASchedulerConfig,
     OptunaStrategyConfig,
     RandomStrategyConfig,
     SlurmSweepSchedulerConfig,
     SweepConfig,
 )
 from prime_rl.sweep.early_stopping import TrialOutcome, TrialOutcomeTracker
-from prime_rl.sweep.materialize import Trial, TrialArtifacts, materialize_trial, record_trial_objective
+from prime_rl.sweep.materialize import (
+    Trial,
+    TrialArtifacts,
+    materialize_multi_run_trial,
+    materialize_trial,
+    multi_run_shared_dir,
+    record_trial_objective,
+)
 from prime_rl.sweep.metrics import read_final_summary
 from prime_rl.sweep.optuna_loop import run_optuna_sweep
 from prime_rl.sweep.reproducibility import git_metadata
-from prime_rl.sweep.schedulers import run_trials_locally, submit_trials_to_slurm
+from prime_rl.sweep.schedulers import (
+    run_trials_locally,
+    submit_trials_to_multi_run_lora,
+    submit_trials_to_slurm,
+)
 from prime_rl.sweep.search import expand_grid, sample_random
 
 
@@ -112,6 +124,27 @@ def _materialize_study(config: SweepConfig) -> list[TrialArtifacts]:
     return artifacts
 
 
+def _materialize_multi_run_study(config: SweepConfig) -> list[TrialArtifacts]:
+    """Materialize all trials as ``run_*`` subdirs under a shared trainer dir.
+
+    Multi-run sweeps invoke ``rl-multi-run`` exactly once with all trials
+    laid out up front. Resume against a still-running shared trainer is a
+    Phase 7b concern, so this path always writes from scratch.
+    """
+    if config.output_dir.exists() and config.clean_output_dir:
+        shutil.rmtree(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    multi_run_shared_dir(config).mkdir(parents=True, exist_ok=True)
+
+    _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
+
+    trials = _expand_trials(config)
+    assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
+    artifacts = [materialize_multi_run_trial(config, trial, config.scheduler) for trial in trials]
+    _write_manifest(config, artifacts)
+    return artifacts
+
+
 def _build_trial_callback(config: SweepConfig, tracker: TrialOutcomeTracker | None):
     if config.objective is None or tracker is None:
         return None
@@ -179,9 +212,60 @@ def _run_optuna(config: SweepConfig) -> None:
         raise SystemExit(1)
 
 
+def _run_multi_run(config: SweepConfig) -> None:
+    """Drive a shared-trainer LoRA sweep through ``rl-multi-run``."""
+    assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
+    artifacts = _materialize_multi_run_study(config)
+
+    if config.dry_run:
+        print(
+            f"Dry run complete. Materialized {len(artifacts)} run dir(s) under "
+            f"{multi_run_shared_dir(config)}."
+        )
+        for artifact in artifacts:
+            print(f"  {artifact.run_dir}")
+        return
+
+    if len(artifacts) > config.scheduler.max_concurrent_runs:
+        raise SystemExit(
+            f"multi_run_lora scheduler.max_concurrent_runs={config.scheduler.max_concurrent_runs} "
+            f"but the search expanded to {len(artifacts)} trials. Increase max_concurrent_runs "
+            "or shrink the search space; chunked execution lands in Phase 7b."
+        )
+
+    failures = submit_trials_to_multi_run_lora(
+        artifacts,
+        shared_paths=config.scheduler.shared,
+        shared_dir=multi_run_shared_dir(config),
+        continue_on_failure=config.continue_on_failure,
+    )
+
+    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
+    if config.objective is not None and tracker is not None:
+        for artifact in artifacts:
+            objective = read_final_summary(artifact.run_dir, config.objective.metric)
+            record_trial_objective(artifact.status_path, objective)
+            tracker.observe(
+                TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
+            )
+        summary = asdict(tracker.summary())
+        _update_manifest_summary(config, summary)
+        if summary["best_trial_id"] is not None:
+            label = tracker.best_label or summary["best_trial_id"]
+            print(f"Best trial: {label} ({summary['best_value']})")
+
+    if failures > 0:
+        print(f"Sweep finished with {failures} failed trial(s) out of {len(artifacts)}.")
+        raise SystemExit(1)
+
+
 def run_sweep(config: SweepConfig) -> None:
     if isinstance(config.strategy, OptunaStrategyConfig):
         _run_optuna(config)
+        return
+
+    if isinstance(config.scheduler, MultiRunLoRASchedulerConfig):
+        _run_multi_run(config)
         return
 
     artifacts = _materialize_study(config)

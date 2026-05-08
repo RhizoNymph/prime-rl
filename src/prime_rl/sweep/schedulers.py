@@ -230,3 +230,61 @@ def submit_trials_to_slurm(
                     raise SystemExit(result.returncode)
                 break
     return failures
+
+
+def submit_trials_to_multi_run_lora(
+    artifacts: list[TrialArtifacts],
+    shared_paths: list[Path],
+    shared_dir: Path,
+    continue_on_failure: bool = True,
+) -> int:
+    """Launch one ``rl-multi-run`` invocation that drives every artifact in parallel.
+
+    The trainer's ``MultiRunManager`` discovers the per-trial ``run_*``
+    directories under ``shared_dir``; an override TOML pins the trainer's
+    ``output_dir`` to ``shared_dir`` so it doesn't fall back to whatever
+    directory the user's base TOML carried. Trials run concurrently inside
+    one trainer process — if the entrypoint exits non-zero we mark every
+    trial failed because we cannot tell which orchestrator(s) crashed
+    without inspecting per-run logs (Phase 7b will refine this).
+
+    No retry loop: re-running a single failed orchestrator without
+    restarting the trainer needs Phase 7b's eviction-aware retry path.
+    Phase 5b's ``FileMonitor`` sidecar metrics still work because
+    ``rl-multi-run`` injects ``PRIME_RL_SWEEP_METRICS_JSONL`` per
+    orchestrator; the controller reads each trial's
+    ``<run_dir>/metrics.jsonl`` via ``read_final_summary`` after the
+    invocation exits.
+    """
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    output_override_path = shared_dir / "_output_override.toml"
+    output_override_path.write_text(f'output_dir = "{shared_dir.as_posix()}"\n')
+
+    command: list[str] = ["rl-multi-run"]
+    for path in shared_paths:
+        command.extend(["@", path.as_posix()])
+    command.extend(["@", output_override_path.as_posix()])
+    command.extend(
+        ["--runs-dir", ":".join(artifact.run_dir.as_posix() for artifact in artifacts)]
+    )
+
+    started = utc_now()
+    for artifact in artifacts:
+        _write_status(artifact, state="running", started_at=started, attempts=1, gpu_group=None)
+
+    result = subprocess.run(command)
+
+    finished = utc_now()
+    if result.returncode == 0:
+        for artifact in artifacts:
+            _write_status(artifact, state="completed", finished_at=finished, returncode=0)
+        return 0
+
+    failures = 0
+    for artifact in artifacts:
+        _write_status(artifact, state="failed", finished_at=finished, returncode=result.returncode)
+        failures += 1
+
+    if not continue_on_failure:
+        raise SystemExit(result.returncode)
+    return failures
