@@ -335,3 +335,47 @@ def test_multi_run_optuna_auto_retries_failed_trials(tmp_path: Path, monkeypatch
     retry_status = json.loads((retry / "status.json").read_text())
     assert retry_status["state"] == "completed"
     assert retry_status["attempts"] == 2
+
+
+def test_multi_run_optuna_fail_fast_writes_done_before_wait(
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
+) -> None:
+    """Fail-fast exits still signal ``--watch-slots`` before waiting.
+
+    Regression coverage: without the done marker in the controller's
+    ``finally`` path, ``proc.wait()`` can block forever after a trial failure
+    with ``continue_on_failure = false``.
+    """
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+    fake_multi_run_popen.exit_codes_by_index = {0: 1}
+    fake_multi_run_popen.assert_done_on_wait = True
+
+    config = SweepConfig(
+        name="lora-optuna-fail-fast",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 3, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert (tmp_path / "study" / "shared" / "control" / "done").exists()
+    assert len(fake_multi_run_popen.instances) == 1
