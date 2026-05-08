@@ -399,9 +399,11 @@ def run_multi_run_optuna_sweep(
 
             time.sleep(poll_interval)
 
-        # 4. All trials told. Signal the launcher and wait for it to drain.
-        _write_done_marker(shared_dir)
     finally:
+        # Signal the launcher on every controller exit path after startup.
+        # Without this, fail-fast exits can leave --watch-slots waiting
+        # forever for new run directories while this process blocks in wait().
+        _write_done_marker(shared_dir)
         proc.wait()
 
     write_manifest_with_variants(

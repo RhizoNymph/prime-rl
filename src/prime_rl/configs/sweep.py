@@ -303,9 +303,10 @@ class MultiRunLoRASchedulerConfig(BaseConfig):
     Static sweeps launch a single ``rl-multi-run`` invocation that brings up
     one trainer (with ``trainer.max_concurrent_runs >= num_trials``), one
     inference server, and ``num_trials`` orchestrators — one per trial.
-    Optuna sweeps run in waves so in-flight trials can be pruned between
-    intermediate metric reports. Resume can reattach to an existing shared
-    trainer state and continue pending trials.
+    Optuna sweeps run in continuous-flow mode so newly freed slots can be
+    replenished while in-flight trials are pruned between intermediate
+    metric reports. Resume can reattach to an existing shared trainer state
+    and continue pending trials.
     """
 
     type: Literal["multi_run_lora"] = "multi_run_lora"

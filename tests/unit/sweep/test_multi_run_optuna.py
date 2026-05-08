@@ -145,6 +145,8 @@ class _FakePopen:
 
     instances: list["_FakePopen"] = []
     _real_popen = None  # populated by _install_fake_optuna_runtime
+    forced_exit_codes_by_index: dict[int, int] = {}
+    assert_done_on_wait = False
 
     def __new__(cls, command, **kwargs):
         if not command or command[0] != "rl-multi-run":
@@ -179,8 +181,12 @@ class _FakePopen:
             (run_dir / "control").mkdir(parents=True, exist_ok=True)
             status_path = run_dir / "status.json"
             status = json.loads(status_path.read_text()) if status_path.exists() else {}
-            code = "1\n" if status.get("state") == "pruned" else "0\n"
-            (run_dir / "control" / "exit_code").write_text(code)
+            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
+            if trial_index in self.forced_exit_codes_by_index:
+                code = self.forced_exit_codes_by_index[trial_index]
+            else:
+                code = 1 if status.get("state") == "pruned" else 0
+            (run_dir / "control" / "exit_code").write_text(f"{code}\n")
             self.seen_run_ids.add(run_dir.name)
 
     def poll(self) -> int | None:
@@ -202,6 +208,8 @@ class _FakePopen:
         # fake settles immediately so the test exits.
         if self.returncode is None:
             self._process_run_dirs()
+            if self.watch_slots and self.assert_done_on_wait:
+                assert (self.shared_dir / "control" / "done").exists()
             self.returncode = 0
         return self.returncode  # type: ignore[return-value]
 
@@ -218,6 +226,8 @@ def _install_fake_optuna_runtime(monkeypatch, study: _StudyStub) -> None:
     monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(multi_run_mod.time, "sleep", lambda *_a, **_kw: None)
     _FakePopen.instances.clear()
+    _FakePopen.forced_exit_codes_by_index = {}
+    _FakePopen.assert_done_on_wait = False
 
 
 def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
@@ -360,3 +370,47 @@ def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None
     for _trial, value, state in study.tells:
         assert state is None
         assert value == 0.5
+
+
+def test_multi_run_optuna_fail_fast_writes_done_before_wait(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Fail-fast exits still signal ``--watch-slots`` before waiting.
+
+    Regression coverage: without the done marker in the controller's
+    ``finally`` path, ``proc.wait()`` can block forever after a trial failure
+    with ``continue_on_failure = false``.
+    """
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+    _FakePopen.forced_exit_codes_by_index = {0: 1}
+    _FakePopen.assert_done_on_wait = True
+
+    config = SweepConfig(
+        name="lora-optuna-fail-fast",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 3, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert (tmp_path / "study" / "shared" / "control" / "done").exists()
+    assert len(_FakePopen.instances) == 1
