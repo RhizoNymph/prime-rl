@@ -150,3 +150,118 @@ def test_materialize_trial_detects_base_drift_on_resume(tmp_path: Path) -> None:
         assert "base" in str(exc).lower()
     else:
         raise AssertionError("Expected SweepDriftError when base file changed under a completed trial")
+
+
+# ---------------------------------------------------------------------------
+# Phase 7a — multi_run_lora trial layout
+# ---------------------------------------------------------------------------
+
+
+def _stub_resolved_rl_config(monkeypatch, captured: dict) -> None:
+    """Replace validate_target_config so we don't need a fully valid RLConfig."""
+    from types import SimpleNamespace
+
+    from prime_rl.sweep import materialize as mat_mod
+
+    def fake_validate(entrypoint, args):
+        captured["entrypoint"] = entrypoint
+        captured["args"] = list(args)
+        # Read the overrides toml the materializer just wrote so the test can
+        # assert on the values that flowed through.
+        overrides_path = Path(args[-1])
+        captured["overrides"] = tomli.loads(overrides_path.read_text())
+        orch = captured["overrides"].get("orchestrator", {})
+
+        class FakeOrch:
+            def model_dump(self, *, exclude_none=True, mode="json"):
+                return orch
+
+        return SimpleNamespace(orchestrator=FakeOrch())
+
+    monkeypatch.setattr(mat_mod, "validate_target_config", fake_validate)
+
+
+def test_materialize_multi_run_trial_writes_run_layout(tmp_path: Path, monkeypatch) -> None:
+    from prime_rl.configs.sweep import MultiRunLoRASchedulerConfig
+    from prime_rl.sweep.materialize import materialize_multi_run_trial
+
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    captured: dict = {}
+    _stub_resolved_rl_config(monkeypatch, captured)
+
+    config = SweepConfig(
+        name="multi-run-test",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    scheduler = config.scheduler
+    assert isinstance(scheduler, MultiRunLoRASchedulerConfig)
+
+    trial = Trial(id="0000-deadbeef", label="lr_1e-5", parameters={"orchestrator.optim.lr": 1e-5})
+
+    artifact = materialize_multi_run_trial(config, trial, scheduler)
+
+    expected_run_dir = tmp_path / "study" / "shared" / "run_0000-deadbeef"
+    assert artifact.run_dir == expected_run_dir
+    assert artifact.trial_dir == expected_run_dir
+    assert (expected_run_dir / "control" / "orch.toml").exists()
+    assert (expected_run_dir / "status.json").exists()
+
+    # The output_dir injected into the resolved orch.toml must match the
+    # run dir the trainer will discover, otherwise the FileMonitor sidecar
+    # would land somewhere the controller never reads.
+    assert captured["overrides"]["orchestrator"]["output_dir"] == expected_run_dir.as_posix()
+    assert captured["overrides"]["orchestrator"]["optim"]["lr"] == 1e-5
+
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "pending"
+    assert status["id"] == "0000-deadbeef"
+
+
+def test_materialize_multi_run_trial_injects_wandb_overrides(tmp_path: Path, monkeypatch) -> None:
+    from prime_rl.configs.sweep import MultiRunLoRASchedulerConfig
+    from prime_rl.sweep.materialize import materialize_multi_run_trial
+
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    captured: dict = {}
+    _stub_resolved_rl_config(monkeypatch, captured)
+
+    config = SweepConfig(
+        name="multi-run-wandb",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+    )
+    scheduler = config.scheduler
+    assert isinstance(scheduler, MultiRunLoRASchedulerConfig)
+
+    trial = Trial(id="0001-cafebabe", label="lr_1e-5", parameters={"orchestrator.optim.lr": 1e-5})
+
+    materialize_multi_run_trial(config, trial, scheduler)
+
+    wandb = captured["overrides"]["orchestrator"]["wandb"]
+    # group defaults to the sweep name when wandb.group is unset
+    assert wandb["group"] == "multi-run-wandb"
+    assert wandb["name"] == "lr_1e-5"
+    # tags include the canonical sweep markers
+    assert "sweep" in wandb["tags"]
+    assert "trial:0001-cafebabe" in wandb["tags"]
+    assert "study:multi-run-wandb" in wandb["tags"]

@@ -438,3 +438,104 @@ def test_optuna_strategy_parses_asha_and_hyperband_pruners(tmp_path: Path) -> No
     assert isinstance(hyperband_config.strategy.pruner, HyperbandPrunerConfig)
     assert hyperband_config.strategy.pruner.min_resource == 4
     assert hyperband_config.strategy.pruner.max_resource == 32
+
+
+# ---------------------------------------------------------------------------
+# Phase 7a — multi_run_lora scheduler
+# ---------------------------------------------------------------------------
+
+
+def test_multi_run_lora_scheduler_parses(tmp_path: Path) -> None:
+    from prime_rl.configs.sweep import MultiRunLoRASchedulerConfig
+
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 4,
+            "shared": [tmp_path / "shared.toml"],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+    assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
+    assert config.scheduler.max_concurrent_runs == 4
+    assert config.scheduler.shared == [tmp_path / "shared.toml"]
+
+
+def test_multi_run_lora_rejects_non_orchestrator_parameter(tmp_path: Path) -> None:
+    """Allowlist: trainer/model/deployment/inference can't vary inside a shared trainer."""
+    with pytest.raises(ValidationError, match="not in the allowlist"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "multi_run_lora",
+                "max_concurrent_runs": 2,
+                "shared": [tmp_path / "shared.toml"],
+            },
+            parameters={"trainer.optim.lr": {"values": [1e-5, 3e-5]}},
+        )
+
+
+def test_multi_run_lora_accepts_lora_alpha_param(tmp_path: Path) -> None:
+    """orchestrator.model.lora.* is in the allowlist."""
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [tmp_path / "shared.toml"],
+        },
+        parameters={"orchestrator.model.lora.alpha": {"values": [16.0, 32.0]}},
+    )
+    assert "orchestrator.model.lora.alpha" in config.parameters
+
+
+def test_multi_run_lora_rejects_sft_entrypoint(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="RL-only"):
+        SweepConfig(
+            entrypoint="sft",
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "multi_run_lora",
+                "max_concurrent_runs": 2,
+                "shared": [tmp_path / "shared.toml"],
+            },
+            parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        )
+
+
+def test_multi_run_lora_rejects_resume(tmp_path: Path) -> None:
+    """Phase 7a: resume against a still-running shared trainer is deferred."""
+    with pytest.raises(ValidationError, match="Resume is not supported"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "multi_run_lora",
+                "max_concurrent_runs": 2,
+                "shared": [tmp_path / "shared.toml"],
+            },
+            parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+            resume=True,
+        )
+
+
+def test_multi_run_lora_rejects_optuna_strategy(tmp_path: Path) -> None:
+    """Phase 7a: Optuna pruning needs trainer-side eviction, deferred to 7b."""
+    with pytest.raises(ValidationError, match="multi_run_lora"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "multi_run_lora",
+                "max_concurrent_runs": 2,
+                "shared": [tmp_path / "shared.toml"],
+            },
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"orchestrator.optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
