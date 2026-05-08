@@ -950,12 +950,33 @@ Phase 5a (this branch):
   Optuna is rejected with the SLURM scheduler since the controller must
   observe each trial before proposing the next.
 
-Deferred to Phase 5b:
+Phase 5b (this branch):
 
-- Median / ASHA / Hyperband pruners through Optuna (currently ``pruner =
-  "none"`` is the only accepted value).
-- Intermediate metric reporting from the controller (W&B step-indexed
-  history / Prime Monitor fallback).
+- ``OptunaStrategyConfig.pruner`` accepts ``none`` (default), ``median``,
+  ``asha`` (Optuna's ``SuccessiveHalvingPruner``), and ``hyperband`` with
+  their pruner-specific kwargs. ``poll_interval_seconds`` controls how
+  often the controller polls intermediate metrics.
+- New ``FileMonitor`` (under ``src/prime_rl/utils/monitor/file.py``) writes
+  one JSON line per ``monitor.log()`` call to a sweep-controlled path. The
+  sweep launcher injects ``PRIME_RL_SWEEP_METRICS_JSONL=<run_dir>/metrics.jsonl``
+  on every trial subprocess; ``setup_monitor`` adds the FileMonitor only
+  when that env var is set, so non-sweep runs are unaffected.
+- ``metrics.jsonl`` is the canonical local stream the sweep controller
+  reads. ``read_final_summary`` returns the value at the largest reported
+  step (falling back to ``final_summary.json`` only if the sidecar is
+  absent), and ``read_intermediate_metric`` returns the latest
+  ``(step, value)`` pair for the polling loop.
+- When a non-trivial pruner is configured the Optuna driver replaces the
+  blocking ``_run_with_retries`` call with a polling driver: it spawns the
+  trial in its own process group, polls the sidecar, calls
+  ``optuna_trial.report`` and ``should_prune``, and on a prune signal
+  SIGTERMs (escalating to SIGKILL) the whole group. Pruned trials record
+  ``state="pruned"`` plus ``pruned_at_step`` / ``pruned_value`` in
+  ``status.json`` and report ``TrialState.PRUNED`` to the study.
+- W&B step-indexed history and Prime Monitor are no longer needed for
+  intermediate-metric reporting because both transports are remote-only;
+  the local sidecar is simpler and works without auth/network. The W&B
+  Public API path is left for future work if a deployment needs it.
 
 ### Phase 6: W&B Sweep Agent Integration
 

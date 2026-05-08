@@ -100,11 +100,83 @@ class RandomStrategyConfig(BaseConfig):
     seed: Annotated[int | None, Field(description="Optional seed for reproducibility.")] = None
 
 
-class OptunaStrategyConfig(BaseConfig):
-    """Adaptive sampling backed by Optuna (TPE / Random samplers).
+class NoPrunerConfig(BaseConfig):
+    """Disable pruning. Trials run to completion regardless of intermediate values."""
 
-    Pruners (median, asha, hyperband) are reserved for a follow-up phase that
-    adds intermediate-metric reporting; only ``"none"`` is accepted today.
+    type: Literal["none"] = "none"
+
+
+class MedianPrunerConfig(BaseConfig):
+    """Optuna's MedianPruner: prune trials whose intermediate value falls below
+    the running median of completed trials at the same step."""
+
+    type: Literal["median"] = "median"
+    n_startup_trials: Annotated[
+        int,
+        Field(ge=0, description="Trials that must complete before pruning is enabled."),
+    ] = 5
+    n_warmup_steps: Annotated[
+        int,
+        Field(ge=0, description="Steps within a trial that are exempt from pruning."),
+    ] = 0
+    interval_steps: Annotated[
+        int,
+        Field(ge=1, description="Pruning is only checked every Nth reported step."),
+    ] = 1
+
+
+class AshaPrunerConfig(BaseConfig):
+    """Optuna's SuccessiveHalvingPruner (ASHA). Promotes trials whose intermediate
+    value is in the top ``1/reduction_factor`` at each rung."""
+
+    type: Literal["asha"] = "asha"
+    min_resource: Annotated[
+        int | Literal["auto"],
+        Field(description="Minimum resource (steps) before a trial can be pruned."),
+    ] = "auto"
+    reduction_factor: Annotated[
+        int,
+        Field(ge=2, description="At each rung, keep the top 1/reduction_factor of trials."),
+    ] = 4
+    min_early_stopping_rate: Annotated[
+        int,
+        Field(ge=0, description="Bracket index offset; 0 enables the most aggressive bracket."),
+    ] = 0
+
+
+class HyperbandPrunerConfig(BaseConfig):
+    """Optuna's HyperbandPruner: runs successive-halving across multiple brackets."""
+
+    type: Literal["hyperband"] = "hyperband"
+    min_resource: Annotated[
+        int,
+        Field(ge=1, description="Smallest resource budget evaluated in any bracket."),
+    ] = 1
+    max_resource: Annotated[
+        int | Literal["auto"],
+        Field(description="Largest resource budget; ``auto`` infers from reported steps."),
+    ] = "auto"
+    reduction_factor: Annotated[
+        int,
+        Field(ge=2, description="At each rung, keep the top 1/reduction_factor of trials."),
+    ] = 3
+
+
+PrunerConfig: TypeAlias = Annotated[
+    NoPrunerConfig | MedianPrunerConfig | AshaPrunerConfig | HyperbandPrunerConfig,
+    Field(discriminator="type"),
+]
+
+
+class OptunaStrategyConfig(BaseConfig):
+    """Adaptive sampling backed by Optuna.
+
+    Samplers: ``tpe`` (default) and ``random``. Pruners: ``none`` (default),
+    ``median``, ``asha`` (successive-halving), and ``hyperband``. Pruners need
+    intermediate metric reporting from the trial; the controller polls a
+    sidecar metrics stream while the trial runs and calls
+    ``optuna_trial.report``/``should_prune`` between samples.
+
     Storage defaults to in-memory; pass a SQLAlchemy URL (e.g.
     ``"sqlite:///optuna.db"``) to persist the study across resume.
     """
@@ -113,7 +185,7 @@ class OptunaStrategyConfig(BaseConfig):
     num_trials: Annotated[int, Field(ge=1, description="Number of trials to evaluate.")]
     seed: int | None = None
     sampler: Literal["tpe", "random"] = "tpe"
-    pruner: Literal["none"] = "none"
+    pruner: PrunerConfig = NoPrunerConfig()
     storage: Annotated[
         str | None,
         Field(description="SQLAlchemy storage URL for study persistence; in-memory if unset."),
@@ -122,6 +194,16 @@ class OptunaStrategyConfig(BaseConfig):
         str | None,
         Field(description="Optuna study_name; defaults to the sweep name."),
     ] = None
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            description=(
+                "How often the controller polls the trial's intermediate metrics "
+                "while pruning is enabled. Ignored when pruner.type == 'none'."
+            ),
+        ),
+    ] = 5.0
 
 
 SearchStrategyConfig: TypeAlias = Annotated[
