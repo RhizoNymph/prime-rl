@@ -1168,11 +1168,19 @@ Phase 7e (shipped):
 - Manifest: each variant gets ``array_task_index: int | None``; the
   manifest gets a top-level ``array_job_id`` after submission so
   ``sacct``/``squeue`` correlation works.
-- Resume: on ``--resume`` the controller re-submits only indices whose
-  status is *not* completed/submitted, using SLURM's compact range
-  syntax (``--array=2,5,7-10``) via ``compress_array_indices``. A
-  prior submission's already-running tasks aren't disturbed; only
-  pending/failed ones come back into a fresh array job.
+- Resume: on ``--resume`` the controller queries
+  ``squeue -j <prior_array_job_id> -h -t pending,running -o "%a"`` to
+  detect tasks still alive on the cluster, intersects that with the
+  status-based skip list (``completed`` / ``submitted``), and submits
+  only the remainder via SLURM's compact range syntax
+  (``--array=2,5,7-10``) through ``compress_array_indices``. The
+  manifest's ``write_manifest_with_variants`` preserves
+  ``array_job_id`` across the resume's re-materialization so the
+  squeue lookup has a job to query. ``query_running_array_tasks``
+  returns an empty set when ``squeue`` fails or the binary is missing
+  — the caller falls back to the conservative (potentially-double-
+  submitting) "resubmit by status" behavior, which over-submits
+  rather than dropping work.
 
 ## Decisions
 
