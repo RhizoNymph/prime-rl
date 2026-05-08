@@ -664,6 +664,132 @@ def test_run_trial_with_pruning_does_not_prune_after_subprocess_exit(tmp_path: P
     assert status["state"] == "completed"
 
 
+def test_optuna_no_pruner_counts_clean_exit_without_objective_as_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: when the no-pruner branch sees returncode==0 but the
+    metric was never logged, Optuna gets TrialState.FAIL — but the sweep
+    must also bump its own failure counter and exit non-zero. Otherwise the
+    sweep finishes 'successfully' even though the sampler recorded failed
+    trials and the run produced no usable objective."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    # _install_fake_run writes {"reward": ...} to final_summary.json. The
+    # sweep asks for a metric named "missing", so read_final_summary returns
+    # None on every clean exit.
+    _install_fake_run(monkeypatch, [0.5, 0.5, 0.5])
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={"type": "optuna", "num_trials": 3, "sampler": "random", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "missing", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+    assert exc_info.value.code == 1
+
+    summary = json.loads((tmp_path / "study" / "manifest.json").read_text())["summary"]
+    # No completed trials with a usable objective.
+    assert summary["completed"] == 0
+    assert summary["best_value"] is None
+
+
+def test_optuna_no_pruner_halts_when_objective_missing_and_no_continue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression: continue_on_failure=False must halt the sweep on the
+    first clean-exit-without-objective trial, not run the rest only to exit
+    later."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    spawned = {"n": 0}
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        overrides = [part for part in command if part.endswith("overrides.toml")]
+        if not overrides:
+            return real_run(command, **kwargs)
+        spawned["n"] += 1
+        run_dir = Path(overrides[0]).parent / "run"
+        summary_dir = run_dir / "run-fake"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        # Writes the metric the sweep is NOT asking for.
+        (summary_dir / "final_summary.json").write_text(json.dumps({"reward": 0.5}))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={"type": "optuna", "num_trials": 5, "sampler": "random", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "missing", "direction": "maximize"},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit):
+        run_sweep(config)
+
+    # Only the first trial ran; continue_on_failure=False halts immediately.
+    assert spawned["n"] == 1
+
+
+def test_optuna_pruner_completed_without_objective_counts_as_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Regression for the pruner-enabled branch: a trial that exits cleanly
+    but never logged the metric (so objective is None even though state ==
+    'completed') must count toward the sweep failure tally."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    # Run a sweep that exercises the pruner branch end-to-end. The fake
+    # subprocess writes a sidecar for a different metric, so the sweep's
+    # configured objective is missing on every trial.
+    def popen_factory(*args, **kwargs):
+        return _FakePopen(*args, rows=[{"step": 1, "different_metric": 0.5}], returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 3,
+            "sampler": "random",
+            "seed": 7,
+            "pruner": {"type": "median", "n_startup_trials": 1, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+    assert exc_info.value.code == 1
+
+
 def test_run_trial_with_pruning_skips_retry_after_intermediate_reports(tmp_path: Path, monkeypatch) -> None:
     """Regression: a failed attempt that already called optuna_trial.report
     must not be retried within the same Optuna trial. Retries on the same

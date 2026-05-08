@@ -479,10 +479,15 @@ def run_optuna_sweep(
             else:
                 study.tell(optuna_trial, objective_value)
 
-            if returncode != 0:
+            # A clean exit without a logged objective (returncode==0 but
+            # objective_value is None) is also a sweep-level failure: Optuna
+            # learned nothing from it, the sampler recorded TrialState.FAIL,
+            # and the user almost certainly wants to be alerted rather than
+            # let the sweep finish 'successfully' with no usable results.
+            if returncode != 0 or objective_value is None:
                 failures += 1
                 if not config.continue_on_failure:
-                    raise SystemExit(returncode)
+                    raise SystemExit(returncode if returncode != 0 else 1)
         else:
             outcome = _run_trial_with_pruning_and_retries(
                 artifact,
@@ -496,10 +501,14 @@ def run_optuna_sweep(
             if outcome.state == "completed":
                 record_trial_objective(artifact.status_path, objective_value)
                 if objective_value is None:
-                    # Completed without a recorded objective (e.g. metric never
-                    # logged): treat as a failed observation so adaptive
-                    # sampling does not get a phantom value.
+                    # Completed without a recorded objective (e.g. metric
+                    # never logged): treat as a sweep-level failure too,
+                    # not just an Optuna FAIL — the sweep produced no
+                    # usable result for this trial.
                     study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                    failures += 1
+                    if not config.continue_on_failure:
+                        raise SystemExit(1)
                 else:
                     study.tell(optuna_trial, objective_value)
             elif outcome.state == "pruned":
