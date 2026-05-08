@@ -461,12 +461,6 @@ class SweepConfig(BaseConfig):
                     "Resume with the Optuna strategy requires strategy.storage so the study "
                     "can be reloaded; in-memory studies vanish when the controller exits."
                 )
-            if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
-                raise ValueError(
-                    "Optuna strategy is not supported with the multi_run_lora scheduler in "
-                    "Phase 7a. Pruning a single run mid-flight needs trainer-side eviction "
-                    "support that lands in Phase 7b."
-                )
         if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
             if self.entrypoint != "rl":
                 raise ValueError(
