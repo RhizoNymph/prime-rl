@@ -1105,19 +1105,42 @@ Phase 7d (shipped):
   per logical trial regardless of how many retries it took, so the
   search backend's view stays clean.
 
-Deferred to Phase 7e (or later):
+Phase 7e (shipped):
 
-- **Live-attach resume.** Controller resuming against a *still-running*
-  trainer torchrun (a different process from the controller that
-  owned the prior sweep). Needs PID file at
-  ``<shared_dir>/.launcher.pid``, heartbeat freshness check, and a
-  hand-off protocol so the new controller can pick up the slot-watch
-  loop.
-- **Static (grid/random) continuous-flow.** Static mode keeps wave
-  semantics with the 7a "max_concurrent_runs >= num_trials" limit.
-  Grid sweeps that need streaming concurrency can use Optuna with a
-  random sampler as a workaround until the static driver gets the
-  same continuous-flow pattern.
+- **Static (grid/random) continuous-flow.** ``run_multi_run_static_continuous_sweep``
+  in ``multi_run.py`` mirrors the Optuna driver's slot-replacement
+  loop minus the ask/tell/prune machinery. Pre-materialized artifacts
+  feed a queue; the initial cohort sized to ``max_concurrent_runs``
+  spawns via ``rl-multi-run --watch-slots`` and replacement trials
+  are dropped into the shared dir as slots free. Lifts the 7a
+  wave-or-bust ``num_trials > max_concurrent_runs`` rejection — large
+  grids stream through one launcher invocation. Auto-retry from 7d-A
+  works on this driver too.
+- **Live-attach resume.** ``rl-multi-run --watch-slots`` now writes
+  ``<shared_dir>/.launcher.pid`` at startup and refreshes
+  ``<shared_dir>/.launcher.heartbeat`` on each watch-slots tick;
+  both files are cleaned up on orderly exit. The continuous-flow
+  drivers (Optuna and static) call ``_detect_running_launcher`` on
+  resume — if the PID is alive and the heartbeat fresh
+  (``DEFAULT_HEARTBEAT_TOLERANCE_SECONDS = 60``), the controller
+  attaches by skipping ``subprocess.Popen`` and just dropping new
+  ``run_*/control/orch.toml`` into the shared dir. The existing
+  launcher's slot-watch loop spawns the orchestrators. End-of-sweep
+  the controller drops the done marker so the attached launcher
+  drains and exits.
+
+  *Live-attach scope:* in-flight trials from the prior controller's
+  invocation are not re-attached to the new controller's live set —
+  ``_reconcile_running_trials`` (existing optuna_loop helper) tells
+  Optuna FAIL for any RUNNING trial whose status.json wasn't already
+  settled. Trials that completed during the controller-down window
+  (the launcher kept running and wrote ``control/exit_code``) get
+  their statuses updated by reconcile but their objectives aren't
+  told to Optuna because the controller doesn't have the original
+  ``optuna_trial`` reference. Practical impact: prior in-flight
+  Optuna trials are lost on controller restart even with live-attach.
+  The trainer + inference stack and any of *their* completed work is
+  preserved; new trials proceed normally on the live trainer.
 
 ### Phase 8: SLURM Arrays
 
