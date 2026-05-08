@@ -122,118 +122,20 @@ class _StudyStub:
         self.tells.append((trial, value, state))
 
 
-class _FakePopen:
-    """Fake ``subprocess.Popen`` that simulates ``rl-multi-run --watch-slots``.
-
-    Continuous-flow mode runs one launcher across the lifetime of the whole
-    sweep. The fake mirrors that: on each ``poll()`` call it scans the parent
-    of its initial ``--runs-dir`` for ``run_*/control/orch.toml`` files,
-    seeds ``metrics.jsonl``, and writes ``control/exit_code`` for every newly
-    discovered run dir (``"1\n"`` if the controller pre-marked the trial as
-    pruned, else ``"0\n"``). ``poll()`` returns ``None`` until the controller
-    drops ``<shared_dir>/control/done``, then ``0``.
-
-    The first poll only "discovers" the initial run dirs from
-    ``--runs-dir``; subsequent polls pick up dirs the controller materialized
-    after the launcher started, which is how we exercise slot replacement.
-
-    Non-``rl-multi-run`` invocations (e.g. ``git rev-parse`` for the manifest's
-    git metadata) are delegated to the real ``subprocess.Popen`` — patching
-    ``multi_run.subprocess.Popen`` patches the stdlib module attribute, so
-    every Popen call in the process flows through here while the test runs.
-    """
-
-    instances: list["_FakePopen"] = []
-    _real_popen = None  # populated by _install_fake_optuna_runtime
-    # Auto-retry test knob: when True, the fake fails the first attempt of
-    # every trial (no ``-r`` suffix in the run dir name) and succeeds on
-    # retries. Stays False for all other tests to keep the existing
-    # success-on-first-attempt behavior.
-    fail_first_attempt: bool = False
-
-    def __new__(cls, command, **kwargs):
-        if not command or command[0] != "rl-multi-run":
-            assert cls._real_popen is not None  # set up by the test fixture
-            return cls._real_popen(command, **kwargs)
-        instance = super().__new__(cls)
-        return instance
-
-    def __init__(self, command, **kwargs) -> None:
-        if not command or command[0] != "rl-multi-run":
-            return  # __new__ delegated to real Popen; nothing to init
-        _FakePopen.instances.append(self)
-        self.command = list(command)
-        idx = command.index("--runs-dir")
-        self.run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        self.shared_dir = self.run_dirs[0].parent
-        self.watch_slots = "--watch-slots" in command
-        self.seen_run_ids: set[str] = set()
-        self.returncode: int | None = None
-
-    def _process_run_dirs(self) -> None:
-        """Seed metrics + exit_code for any new run_*/control/orch.toml dirs."""
-        for run_dir in sorted(self.shared_dir.glob("run_*")):
-            if run_dir.name in self.seen_run_ids:
-                continue
-            if not (run_dir / "control" / "orch.toml").exists():
-                continue
-            run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            status_path = run_dir / "status.json"
-            status = json.loads(status_path.read_text()) if status_path.exists() else {}
-            is_retry = "-r" in run_dir.name.removeprefix("run_")
-            if _FakePopen.fail_first_attempt and not is_retry:
-                # Simulate a transient failure: orchestrator exited non-zero
-                # before producing any metrics.
-                code = "1\n"
-            else:
-                (run_dir / "metrics.jsonl").write_text(
-                    json.dumps({"step": 1, "reward": 0.5}) + "\n"
-                )
-                code = "1\n" if status.get("state") == "pruned" else "0\n"
-            (run_dir / "control" / "exit_code").write_text(code)
-            self.seen_run_ids.add(run_dir.name)
-
-    def poll(self) -> int | None:
-        self._process_run_dirs()
-        if self.watch_slots:
-            done_marker = self.shared_dir / "control" / "done"
-            if done_marker.exists():
-                self.returncode = 0
-                return 0
-            return None
-        # Wave-mode fallback (any caller that hasn't migrated yet): one poll
-        # tick of work, then exit cleanly.
-        self.returncode = 0
-        return 0
-
-    def wait(self) -> int:
-        # If the loop never managed to write done (e.g. tracker.halted before
-        # all trials were submitted), this would hang in production. The
-        # fake settles immediately so the test exits.
-        if self.returncode is None:
-            self._process_run_dirs()
-            self.returncode = 0
-        return self.returncode  # type: ignore[return-value]
-
-
 def _install_fake_optuna_runtime(monkeypatch, study: _StudyStub) -> None:
-    """Replace the create-study helper, Popen, and time.sleep so the wave
-    driver runs synchronously against the fake process."""
-    import subprocess as real_subprocess
+    """Override Optuna's ``_create_study`` with the test's stub.
 
+    The Popen patch + time.sleep patch + ``FakeMultiRunPopen`` reset all live
+    in the shared ``fake_multi_run_popen`` fixture (conftest.py); this helper
+    just supplies the study.
+    """
     from prime_rl.sweep import multi_run as multi_run_mod
 
-    _FakePopen._real_popen = real_subprocess.Popen
     monkeypatch.setattr(multi_run_mod, "_create_study", lambda *a, **kw: study)
-    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _FakePopen)
-    monkeypatch.setattr(multi_run_mod.time, "sleep", lambda *_a, **_kw: None)
-    _FakePopen.instances.clear()
-    _FakePopen.fail_first_attempt = False
 
 
 def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
 ) -> None:
     """One wave of 3 trials: trial #1 is configured to prune; the other
     two run to completion and report their objective."""
@@ -273,8 +175,8 @@ def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
     run_sweep(config)
 
     # One wave → one Popen.
-    assert len(_FakePopen.instances) == 1
-    invocation = _FakePopen.instances[0]
+    assert len(fake_multi_run_popen.instances) == 1
+    invocation = fake_multi_run_popen.instances[0]
     assert invocation.command[0] == "rl-multi-run"
     assert "--runs-dir" in invocation.command
 
@@ -315,7 +217,7 @@ def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
     assert states_by_index == {0: "completed", 1: "pruned", 2: "completed"}
 
 
-def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None:
+def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch, fake_multi_run_popen) -> None:
     """``num_trials=4, max_concurrent_runs=2``: one launcher, four trials.
 
     Phase 7c: continuous-flow replaces wave-mode. The controller spawns
@@ -351,8 +253,8 @@ def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None
     run_sweep(config)
 
     # Single launcher for the whole sweep.
-    assert len(_FakePopen.instances) == 1
-    invocation = _FakePopen.instances[0]
+    assert len(fake_multi_run_popen.instances) == 1
+    invocation = fake_multi_run_popen.instances[0]
     runs_idx = invocation.command.index("--runs-dir")
     initial_run_dirs = invocation.command[runs_idx + 1].split(":")
     # Initial cohort sized to max_concurrent_runs.
@@ -374,7 +276,7 @@ def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None
         assert value == 0.5
 
 
-def test_multi_run_optuna_auto_retries_failed_trials(tmp_path: Path, monkeypatch) -> None:
+def test_multi_run_optuna_auto_retries_failed_trials(tmp_path: Path, monkeypatch, fake_multi_run_popen) -> None:
     """Phase 7d-A: a failed orchestrator with retry budget is re-materialized.
 
     The first attempt's run dir gets exit_code=1 (no metrics). The controller
@@ -392,7 +294,7 @@ def test_multi_run_optuna_auto_retries_failed_trials(tmp_path: Path, monkeypatch
     _install_fake_optuna_runtime(monkeypatch, study)
 
     # First attempt of every trial fails; the retry succeeds.
-    _FakePopen.fail_first_attempt = True
+    fake_multi_run_popen.fail_first_attempt = True
 
     config = SweepConfig(
         name="lora-optuna-retry",

@@ -19,6 +19,7 @@ moment any slot frees instead of waiting for an entire wave to finish.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -61,6 +62,89 @@ if TYPE_CHECKING:  # pragma: no cover
 EVICTED_FILENAME = "evicted.txt"
 DONE_MARKER_NAME = "done"
 EXIT_CODE_FILENAME = "exit_code"
+LAUNCHER_PID_FILENAME = ".launcher.pid"
+LAUNCHER_HEARTBEAT_FILENAME = ".launcher.heartbeat"
+DEFAULT_HEARTBEAT_TOLERANCE_SECONDS = 60.0
+
+
+def _process_alive(pid: int) -> bool:
+    """``os.kill(pid, 0)`` raises ``ProcessLookupError`` if the PID is dead.
+
+    Permission errors (e.g. PID belongs to another user) count as "alive"
+    here because we still don't want to spawn a duplicate launcher in that
+    case — the user almost certainly hit a misconfiguration we should
+    surface, not silently overwrite.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _detect_running_launcher(
+    shared_dir: Path,
+    *,
+    max_age_seconds: float = DEFAULT_HEARTBEAT_TOLERANCE_SECONDS,
+) -> int | None:
+    """Return the PID of a still-running ``rl-multi-run --watch-slots``, or None.
+
+    The launcher writes ``.launcher.pid`` at startup and refreshes
+    ``.launcher.heartbeat`` on each watch-slots tick. Resume considers the
+    launcher live when both files exist, the PID is alive, and the heartbeat
+    is within ``max_age_seconds`` (covers a slow tick + clock skew).
+
+    A live launcher means the controller can attach via the file protocol
+    (drop ``run_*/control/orch.toml`` and the launcher's slot-watch loop
+    spawns the orchestrator) instead of re-spawning the trainer/inference
+    stack. Anything stale or absent → fall back to stop+resume.
+    """
+    pid_path = shared_dir / LAUNCHER_PID_FILENAME
+    heartbeat_path = shared_dir / LAUNCHER_HEARTBEAT_FILENAME
+    if not pid_path.exists() or not heartbeat_path.exists():
+        return None
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if not _process_alive(pid):
+        return None
+    try:
+        age = time.time() - heartbeat_path.stat().st_mtime
+    except OSError:
+        return None
+    if age > max_age_seconds:
+        return None
+    return pid
+
+
+def _wait_for_pid_exit(pid: int, *, poll_interval: float = 0.5) -> None:
+    """Block until ``pid`` is no longer alive."""
+    while _process_alive(pid):
+        time.sleep(poll_interval)
+
+
+def _launcher_is_alive(
+    proc: subprocess.Popen[bytes] | None, existing_pid: int | None
+) -> bool:
+    """True iff the launcher (owned or attached) is still running."""
+    if proc is not None:
+        return proc.poll() is None
+    if existing_pid is not None:
+        return _process_alive(existing_pid)
+    return False
+
+
+def _wait_for_launcher_exit(
+    proc: subprocess.Popen[bytes] | None, existing_pid: int | None
+) -> None:
+    """Block until the launcher exits, regardless of who owns it."""
+    if proc is not None:
+        proc.wait()
+    elif existing_pid is not None:
+        _wait_for_pid_exit(existing_pid)
 
 
 @dataclass
@@ -332,16 +416,26 @@ def run_multi_run_optuna_sweep(
             live_trial.artifact, state="running", started_at=started, attempts=1, gpu_group=None
         )
 
-    # 2. Spawn rl-multi-run --watch-slots.
+    # 2. Spawn rl-multi-run --watch-slots, OR attach to a live one (Phase 7e).
     initial_artifacts = [lt.artifact for lt in live.values()]
-    command = build_multi_run_command(initial_artifacts, scheduler.shared, shared_dir)
-    command.append("--watch-slots")
-    proc = subprocess.Popen(command)
+    existing_pid = _detect_running_launcher(shared_dir) if config.resume else None
+    proc: subprocess.Popen[bytes] | None
+    if existing_pid is not None:
+        # Live-attach: the prior launcher is still running and accepting
+        # new run dirs through its watch-slots loop. Skip the trainer +
+        # inference re-spawn; just drop the new run dirs into shared_dir
+        # and the launcher picks them up.
+        proc = None
+        print(f"Live-attach: resuming against running launcher (pid={existing_pid}).")
+    else:
+        command = build_multi_run_command(initial_artifacts, scheduler.shared, shared_dir)
+        command.append("--watch-slots")
+        proc = subprocess.Popen(command)
 
     try:
         # 3. Continuous-flow loop.
         while live:
-            if proc.poll() is not None:
+            if not _launcher_is_alive(proc, existing_pid):
                 # Launcher died unexpectedly. Settle whatever's still alive
                 # so Optuna's view doesn't have RUNNING trials hanging. No
                 # retries on this path: the trainer is gone, retrying would
@@ -466,12 +560,216 @@ def run_multi_run_optuna_sweep(
         # 4. All trials told. Signal the launcher and wait for it to drain.
         _write_done_marker(shared_dir)
     finally:
-        proc.wait()
+        _wait_for_launcher_exit(proc, existing_pid)
 
     write_manifest_with_variants(
         config, previous_variants + [build_variant(a) for a in all_artifacts]
     )
     return failures, tracker, all_artifacts
+
+
+def _reconcile_static_trial_state(
+    live_trial: _LiveTrial,
+    metric: str,
+) -> tuple[str, float | None]:
+    """Static-mode counterpart to ``_reconcile_trial_state``.
+
+    Identical reconcile logic minus the metric-was-None → "failed" collapse:
+    static sweeps don't tell anyone about the trial in a way the search
+    backend cares about, so a missing metric just becomes ``objective=None``
+    on a completed trial. Auto-retry still triggers on actual subprocess
+    failures (state="failed" from a non-zero exit_code).
+    """
+    state = reconcile_multi_run_artifact(
+        live_trial.artifact, aggregate_returncode=0, finished_at=utc_now()
+    )
+
+    objective: float | None = None
+    if state == "completed":
+        objective = read_final_summary(live_trial.artifact.run_dir, metric)
+        record_trial_objective(live_trial.artifact.status_path, objective)
+    elif state == "failed":
+        record_trial_objective(live_trial.artifact.status_path, None)
+
+    return state, objective
+
+
+def run_multi_run_static_continuous_sweep(
+    config: SweepConfig,
+    artifacts: list[TrialArtifacts],
+    *,
+    write_manifest_with_variants: Any,
+    build_variant: Any,
+) -> tuple[int, TrialOutcomeTracker | None]:
+    """Drive a static (grid/random) shared-trainer LoRA sweep continuously.
+
+    Mirrors ``run_multi_run_optuna_sweep``'s slot-replacement loop without the
+    Optuna asks/tells/pruning. Pre-materialized artifacts feed a queue; the
+    initial cohort sized ``max_concurrent_runs`` launches via
+    ``rl-multi-run --watch-slots``. As each slot frees the controller pulls
+    the next pending artifact, writes its status to ``running``, and the
+    launcher's slot-watch loop spawns the orchestrator.
+
+    Lifts the 7a wave-or-bust limit: large grids stream through the same
+    launcher invocation instead of needing ``num_trials <= max_concurrent_runs``.
+    """
+    scheduler = config.scheduler
+    assert isinstance(scheduler, MultiRunLoRASchedulerConfig)
+
+    metric = config.objective.metric if config.objective else None
+    target_concurrency = scheduler.max_concurrent_runs
+    poll_interval = 2.0  # static has no strategy.poll_interval_seconds; mirror the launcher's tick
+
+    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
+    shared_dir = multi_run_shared_dir(config)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+
+    # Already-terminal trials (resume) keep their preserved artifacts and
+    # only contribute to the tracker; only "pending" trials get launched.
+    pending_queue: list[TrialArtifacts] = [
+        a for a in artifacts if json.loads(a.status_path.read_text()).get("state") == "pending"
+    ]
+
+    # Seed tracker from preserved completed trials so the manifest summary
+    # reflects history.
+    if tracker is not None:
+        for artifact in artifacts:
+            status = json.loads(artifact.status_path.read_text())
+            if status.get("state") != "completed":
+                continue
+            tracker.observe(
+                TrialOutcome(
+                    trial_id=artifact.trial.id,
+                    label=artifact.trial.label,
+                    objective=status.get("objective"),
+                )
+            )
+
+    failures = 0
+
+    if not pending_queue:
+        if config.resume:
+            print("Resume: every trial already terminal, no new work to launch.")
+        return failures, tracker
+
+    # 1. Initial cohort.
+    initial = pending_queue[:target_concurrency]
+    remaining: list[TrialArtifacts] = pending_queue[target_concurrency:]
+    live: dict[Path, _LiveTrial] = {}
+    started = utc_now()
+    for artifact in initial:
+        _write_status(artifact, state="running", started_at=started, attempts=1, gpu_group=None)
+        # optuna_trial=None — static has no search backend to tell.
+        live[artifact.run_dir] = _LiveTrial(optuna_trial=None, artifact=artifact)
+
+    # 2. Spawn rl-multi-run --watch-slots, OR attach to a live one (Phase 7e).
+    existing_pid = _detect_running_launcher(shared_dir) if config.resume else None
+    proc: subprocess.Popen[bytes] | None
+    if existing_pid is not None:
+        proc = None
+        print(f"Live-attach: resuming against running launcher (pid={existing_pid}).")
+    else:
+        command = build_multi_run_command(initial, scheduler.shared, shared_dir)
+        command.append("--watch-slots")
+        proc = subprocess.Popen(command)
+
+    try:
+        while live:
+            if not _launcher_is_alive(proc, existing_pid):
+                # Launcher died; settle anything still alive without retry.
+                for live_trial in list(live.values()):
+                    state, objective = _reconcile_static_trial_state(live_trial, metric or "")
+                    if state == "failed":
+                        failures += 1
+                    if tracker is not None:
+                        tracker.observe(
+                            TrialOutcome(
+                                trial_id=live_trial.artifact.trial.id,
+                                label=live_trial.artifact.trial.label,
+                                objective=objective,
+                            )
+                        )
+                live.clear()
+                break
+
+            for run_dir in list(live.keys()):
+                live_trial = live[run_dir]
+                if not _exit_code_path(run_dir).exists():
+                    continue
+
+                state, objective = _reconcile_static_trial_state(live_trial, metric or "")
+
+                # Auto-retry on transient failure.
+                if state == "failed" and live_trial.attempts < config.retry_budget + 1:
+                    new_attempt = live_trial.attempts + 1
+                    try:
+                        retry_artifact = materialize_multi_run_trial(
+                            config, live_trial.artifact.trial, scheduler, attempt=new_attempt - 1
+                        )
+                    except Exception as exc:
+                        print(
+                            f"Static trial {live_trial.artifact.trial.id} retry "
+                            f"{new_attempt} failed materialization: {exc}"
+                        )
+                    else:
+                        artifacts.append(retry_artifact)
+                        _write_status(
+                            retry_artifact,
+                            state="running",
+                            started_at=utc_now(),
+                            attempts=new_attempt,
+                            gpu_group=None,
+                        )
+                        live.pop(run_dir)
+                        live[retry_artifact.run_dir] = _LiveTrial(
+                            optuna_trial=None,
+                            artifact=retry_artifact,
+                            attempts=new_attempt,
+                        )
+                        write_manifest_with_variants(
+                            config, [build_variant(a) for a in artifacts]
+                        )
+                        continue
+
+                if state == "failed":
+                    failures += 1
+                    if not config.continue_on_failure:
+                        live.pop(run_dir)
+                        raise SystemExit(1)
+
+                if tracker is not None:
+                    tracker.observe(
+                        TrialOutcome(
+                            trial_id=live_trial.artifact.trial.id,
+                            label=live_trial.artifact.trial.label,
+                            objective=objective,
+                        )
+                    )
+                live.pop(run_dir)
+
+                # Pull the next pending trial off the queue and let the
+                # launcher's watch-slots loop spawn its orchestrator.
+                if remaining and (tracker is None or not tracker.halted):
+                    next_artifact = remaining.pop(0)
+                    _write_status(
+                        next_artifact,
+                        state="running",
+                        started_at=utc_now(),
+                        attempts=1,
+                        gpu_group=None,
+                    )
+                    live[next_artifact.run_dir] = _LiveTrial(
+                        optuna_trial=None, artifact=next_artifact
+                    )
+
+            time.sleep(poll_interval)
+
+        _write_done_marker(shared_dir)
+    finally:
+        _wait_for_launcher_exit(proc, existing_pid)
+
+    write_manifest_with_variants(config, [build_variant(a) for a in artifacts])
+    return failures, tracker
 
 
 # Re-exported for the controller to update the manifest summary.
