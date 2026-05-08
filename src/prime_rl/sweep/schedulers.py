@@ -232,29 +232,40 @@ def submit_trials_to_slurm(
     return failures
 
 
-def submit_trials_to_multi_run_lora(
+EXIT_CODE_FILENAME = "exit_code"
+"""Per-orchestrator returncode written by ``rl-multi-run``; the source of truth
+for per-trial failure attribution in multi_run_lora sweeps."""
+
+
+def _read_orchestrator_exit_code(artifact: TrialArtifacts) -> int | None:
+    """Read ``<run_dir>/control/exit_code`` written by the launcher.
+
+    Returns ``None`` when the file is missing — typically the launcher died
+    before this orchestrator started, or the file was lost. Callers treat
+    ``None`` as an infrastructure failure distinct from a recorded non-zero
+    returncode.
+    """
+    path = artifact.run_dir / "control" / EXIT_CODE_FILENAME
+    if not path.exists():
+        return None
+    raw = path.read_text().strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def build_multi_run_command(
     artifacts: list[TrialArtifacts],
     shared_paths: list[Path],
     shared_dir: Path,
-    continue_on_failure: bool = True,
-) -> int:
-    """Launch one ``rl-multi-run`` invocation that drives every artifact in parallel.
+) -> list[str]:
+    """Compose the ``rl-multi-run`` invocation for a wave of trials.
 
-    The trainer's ``MultiRunManager`` discovers the per-trial ``run_*``
-    directories under ``shared_dir``; an override TOML pins the trainer's
-    ``output_dir`` to ``shared_dir`` so it doesn't fall back to whatever
-    directory the user's base TOML carried. Trials run concurrently inside
-    one trainer process — if the entrypoint exits non-zero we mark every
-    trial failed because we cannot tell which orchestrator(s) crashed
-    without inspecting per-run logs (Phase 7b will refine this).
-
-    No retry loop: re-running a single failed orchestrator without
-    restarting the trainer needs Phase 7b's eviction-aware retry path.
-    Phase 5b's ``FileMonitor`` sidecar metrics still work because
-    ``rl-multi-run`` injects ``PRIME_RL_SWEEP_METRICS_JSONL`` per
-    orchestrator; the controller reads each trial's
-    ``<run_dir>/metrics.jsonl`` via ``read_final_summary`` after the
-    invocation exits.
+    Pulled out so the Optuna wave driver can spawn the same command via
+    ``Popen`` (for mid-flight pruning) instead of ``subprocess.run``.
     """
     shared_dir.mkdir(parents=True, exist_ok=True)
     output_override_path = shared_dir / "_output_override.toml"
@@ -267,6 +278,72 @@ def submit_trials_to_multi_run_lora(
     command.extend(
         ["--runs-dir", ":".join(artifact.run_dir.as_posix() for artifact in artifacts)]
     )
+    return command
+
+
+def reconcile_multi_run_artifact(
+    artifact: TrialArtifacts,
+    *,
+    aggregate_returncode: int,
+    finished_at: str,
+) -> str:
+    """Reconcile one artifact's status from the launcher's per-run signals.
+
+    Returns the final ``state`` written ("completed", "failed", or "pruned").
+    Pre-existing ``state="pruned"`` is preserved verbatim — the controller
+    sets it before writing ``evicted.txt`` for that run, and the orchestrator's
+    non-zero exit must not flip it to ``failed``.
+
+    When the per-run ``exit_code`` is missing we treat it as an infrastructure
+    failure: prefer the aggregate launcher returncode for diagnostics, but
+    failing back to ``-1`` if even that is zero (a paradox: the launcher
+    exited cleanly but produced no exit_code for this orchestrator).
+    """
+    status = _read_status(artifact)
+    if status.get("state") == "pruned":
+        return "pruned"
+
+    per_run_code = _read_orchestrator_exit_code(artifact)
+    if per_run_code == 0:
+        _write_status(artifact, state="completed", finished_at=finished_at, returncode=0)
+        return "completed"
+
+    if per_run_code is None:
+        # Launcher died before recording this run's exit code. Pick the
+        # aggregate returncode if it carries useful info; -1 as a fallback
+        # so the field is never zero on a failure path.
+        effective = aggregate_returncode if aggregate_returncode != 0 else -1
+    else:
+        effective = per_run_code
+    _write_status(artifact, state="failed", finished_at=finished_at, returncode=effective)
+    return "failed"
+
+
+def submit_trials_to_multi_run_lora(
+    artifacts: list[TrialArtifacts],
+    shared_paths: list[Path],
+    shared_dir: Path,
+    continue_on_failure: bool = True,
+) -> int:
+    """Launch one ``rl-multi-run`` invocation that drives every artifact in parallel.
+
+    The trainer's ``MultiRunManager`` discovers the per-trial ``run_*``
+    directories under ``shared_dir``; an override TOML pins the trainer's
+    ``output_dir`` to ``shared_dir`` so it doesn't fall back to whatever
+    directory the user's base TOML carried. Trials run concurrently inside
+    one trainer process; the launcher writes ``<run_dir>/control/exit_code``
+    per orchestrator, and we reconcile per-trial state from those files
+    (instead of marking every trial failed on a non-zero aggregate).
+
+    No retry loop: re-running a single failed orchestrator without
+    restarting the trainer needs dynamic slot replacement (Phase 7c).
+    Phase 5b's ``FileMonitor`` sidecar metrics still work because
+    ``rl-multi-run`` injects ``PRIME_RL_SWEEP_METRICS_JSONL`` per
+    orchestrator; the controller reads each trial's
+    ``<run_dir>/metrics.jsonl`` via ``read_final_summary`` after the
+    invocation exits.
+    """
+    command = build_multi_run_command(artifacts, shared_paths, shared_dir)
 
     started = utc_now()
     for artifact in artifacts:
@@ -275,16 +352,14 @@ def submit_trials_to_multi_run_lora(
     result = subprocess.run(command)
 
     finished = utc_now()
-    if result.returncode == 0:
-        for artifact in artifacts:
-            _write_status(artifact, state="completed", finished_at=finished, returncode=0)
-        return 0
-
     failures = 0
     for artifact in artifacts:
-        _write_status(artifact, state="failed", finished_at=finished, returncode=result.returncode)
-        failures += 1
+        state = reconcile_multi_run_artifact(
+            artifact, aggregate_returncode=result.returncode, finished_at=finished
+        )
+        if state == "failed":
+            failures += 1
 
-    if not continue_on_failure:
-        raise SystemExit(result.returncode)
+    if failures > 0 and not continue_on_failure:
+        raise SystemExit(result.returncode if result.returncode != 0 else 1)
     return failures
