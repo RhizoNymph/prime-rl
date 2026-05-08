@@ -367,3 +367,74 @@ def test_optuna_strategy_parses_with_storage(tmp_path: Path) -> None:
     assert isinstance(config.strategy, OptunaStrategyConfig)
     assert config.strategy.sampler == "random"
     assert config.strategy.storage == "sqlite:///optuna.db"
+
+
+def test_optuna_strategy_default_pruner_is_none(tmp_path: Path) -> None:
+    """Phase 5a configs must keep parsing: pruner defaults to type='none'."""
+    from prime_rl.configs.sweep import NoPrunerConfig
+
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={"type": "optuna", "num_trials": 2},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert isinstance(config.strategy.pruner, NoPrunerConfig)
+    assert config.strategy.poll_interval_seconds == 5.0
+
+
+def test_optuna_strategy_parses_median_pruner(tmp_path: Path) -> None:
+    from prime_rl.configs.sweep import MedianPrunerConfig
+
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 4,
+            "pruner": {"type": "median", "n_startup_trials": 3, "n_warmup_steps": 10, "interval_steps": 2},
+            "poll_interval_seconds": 1.5,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert isinstance(config.strategy.pruner, MedianPrunerConfig)
+    assert config.strategy.pruner.n_startup_trials == 3
+    assert config.strategy.pruner.n_warmup_steps == 10
+    assert config.strategy.pruner.interval_steps == 2
+    assert config.strategy.poll_interval_seconds == 1.5
+
+
+def test_optuna_strategy_parses_asha_and_hyperband_pruners(tmp_path: Path) -> None:
+    from prime_rl.configs.sweep import AshaPrunerConfig, HyperbandPrunerConfig
+
+    asha_config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 4,
+            "pruner": {"type": "asha", "min_resource": 8, "reduction_factor": 3},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert isinstance(asha_config.strategy.pruner, AshaPrunerConfig)
+    assert asha_config.strategy.pruner.min_resource == 8
+    assert asha_config.strategy.pruner.reduction_factor == 3
+
+    hyperband_config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 4,
+            "pruner": {"type": "hyperband", "min_resource": 4, "max_resource": 32, "reduction_factor": 4},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert isinstance(hyperband_config.strategy.pruner, HyperbandPrunerConfig)
+    assert hyperband_config.strategy.pruner.min_resource == 4
+    assert hyperband_config.strategy.pruner.max_resource == 32

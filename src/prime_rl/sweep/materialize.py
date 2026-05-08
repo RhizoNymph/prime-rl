@@ -106,6 +106,22 @@ def record_trial_objective(status_path: Path, value: float | None) -> None:
     write_json(status_path, status)
 
 
+def record_trial_pruned(status_path: Path, step: int, value: float) -> None:
+    """Mark a trial as pruned by intermediate-metric reporting.
+
+    The Optuna pruning loop terminates the trial subprocess when the sampler
+    decides the trajectory is unpromising. We record state="pruned" plus the
+    step/value the prune fired on so the manifest can tell pruned trials
+    apart from completed and failed runs without re-deriving the cause.
+    """
+    status = json.loads(status_path.read_text())
+    status["state"] = "pruned"
+    status["pruned_at_step"] = int(step)
+    status["pruned_value"] = float(value)
+    status["objective"] = None
+    write_json(status_path, status)
+
+
 def validate_target_config(entrypoint: Literal["rl", "sft"], args: list[str]) -> BaseConfig:
     config_cls = RLConfig if entrypoint == "rl" else SFTConfig
     return cli(config_cls, args=args)
