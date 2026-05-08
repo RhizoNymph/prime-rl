@@ -197,6 +197,7 @@ def test_submit_trials_to_slurm_array_writes_sbatch_and_submits(
     assert "#SBATCH --time=01:00:00" in text
     assert "#SBATCH --cpus-per-task=8" in text
     assert "#SBATCH --exclusive" in text
+    assert f'cd "{Path.cwd().as_posix()}"' in text
     assert "uv run sweep-array-task" in text
     assert str(study_dir) in text
 

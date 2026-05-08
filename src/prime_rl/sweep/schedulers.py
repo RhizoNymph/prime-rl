@@ -237,10 +237,11 @@ def query_running_array_tasks(array_job_id: str | None) -> set[int]:
     indices the cluster still owns and skip them.
 
     Empty array job ID, ``squeue`` failure, or a missing binary all return
-    an empty set — the caller falls back to the conservative
-    "resubmit-by-status" behavior, which over-submits rather than dropping
-    work. Surfacing the squeue error inline would be noisier without
-    making the answer better.
+    an empty set — the caller falls back to status-only filtering, which
+    still treats ``submitted`` tasks as owned by the prior array job to avoid
+    duplicate cluster submissions when queue visibility is unavailable.
+    Surfacing the squeue error inline would be noisier without making the
+    answer better.
     """
     if not array_job_id:
         return set()
@@ -296,6 +297,7 @@ def _read_slurm_block_from_resolved(resolved_path: Path) -> dict:
 def _render_array_sbatch(
     *,
     study_dir: Path,
+    work_dir: Path,
     array_spec: str,
     slurm_block: dict,
     log_dir: Path,
@@ -348,7 +350,7 @@ def _render_array_sbatch(
 
     body = (
         "set -euo pipefail\n"
-        f'cd "{study_dir.as_posix()}"\n'
+        f'cd "{work_dir.as_posix()}"\n'
         f'exec uv run sweep-array-task "{study_dir.as_posix()}"\n'
     )
     return "#!/bin/bash\n" + "\n".join(directives) + "\n\n" + body
@@ -388,6 +390,7 @@ def submit_trials_to_slurm_array(
     slurm_block = _read_slurm_block_from_resolved(selected[0].resolved_path)
     sbatch_text = _render_array_sbatch(
         study_dir=study_dir,
+        work_dir=Path.cwd(),
         array_spec=array_spec,
         slurm_block=slurm_block,
         log_dir=log_dir,
