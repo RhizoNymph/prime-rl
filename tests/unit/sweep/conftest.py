@@ -55,6 +55,7 @@ class FakeMultiRunPopen:
     exit_codes_by_index: dict[int, int | None] = {}
     rewards_by_index: dict[int, float] = {}
     default_reward: float = 0.5
+    assert_done_on_wait: bool = False
 
     def __new__(cls, command, **kwargs):
         if not command or command[0] != "rl-multi-run":
@@ -130,6 +131,8 @@ class FakeMultiRunPopen:
     def wait(self) -> int:
         if self.returncode is None:
             self._process_run_dirs()
+            if self.watch_slots and FakeMultiRunPopen.assert_done_on_wait:
+                assert (self.shared_dir / "control" / "done").exists()
             self.returncode = 0
         return self.returncode  # type: ignore[return-value]
 
@@ -153,6 +156,7 @@ def fake_multi_run_popen(monkeypatch):
     FakeMultiRunPopen.exit_codes_by_index = {}
     FakeMultiRunPopen.rewards_by_index = {}
     FakeMultiRunPopen.default_reward = 0.5
+    FakeMultiRunPopen.assert_done_on_wait = False
 
     monkeypatch.setattr(multi_run_mod.subprocess, "Popen", FakeMultiRunPopen)
     monkeypatch.setattr(multi_run_mod.time, "sleep", lambda *_a, **_kw: None)
@@ -161,3 +165,4 @@ def fake_multi_run_popen(monkeypatch):
     FakeMultiRunPopen.exit_codes_by_index = {}
     FakeMultiRunPopen.rewards_by_index = {}
     FakeMultiRunPopen.fail_first_attempt = False
+    FakeMultiRunPopen.assert_done_on_wait = False
