@@ -301,9 +301,16 @@ def multi_run_shared_dir(config: SweepConfig) -> Path:
     return config.output_dir / "shared"
 
 
-def multi_run_trial_dir(config: SweepConfig, trial: Trial) -> Path:
-    """Per-trial directory the trainer will discover as a ``run_*`` slot."""
-    return multi_run_shared_dir(config) / f"run_{trial.id}"
+def multi_run_trial_dir(config: SweepConfig, trial: Trial, attempt: int = 0) -> Path:
+    """Per-trial directory the trainer will discover as a ``run_*`` slot.
+
+    ``attempt > 0`` produces a retry directory (``run_<id>-r<N>``) that the
+    trainer's ``MultiRunManager`` treats as a fresh slot. The original
+    failed dir's status is preserved as historical record; the retry's
+    status carries the authoritative outcome for the logical trial.
+    """
+    suffix = f"-r{attempt}" if attempt > 0 else ""
+    return multi_run_shared_dir(config) / f"run_{trial.id}{suffix}"
 
 
 def materialize_multi_run_trial(
@@ -312,6 +319,7 @@ def materialize_multi_run_trial(
     scheduler: Any,  # MultiRunLoRASchedulerConfig — typed as Any to avoid an import cycle
     resume: bool = False,
     expected_checksums: dict[str, Any] | None = None,
+    attempt: int = 0,
 ) -> TrialArtifacts:
     """Write a per-trial ``run_<id>/control/orch.toml`` for a shared-trainer sweep.
 
@@ -324,7 +332,7 @@ def materialize_multi_run_trial(
     ``read_intermediate_metric``) keep working unchanged once the
     orchestrator's ``FileMonitor`` writes ``metrics.jsonl`` there.
     """
-    run_dir = multi_run_trial_dir(config, trial)
+    run_dir = multi_run_trial_dir(config, trial, attempt)
     control_dir = run_dir / "control"
     overrides_path = run_dir / "overrides.toml"
     resolved_path = run_dir / "resolved.toml"

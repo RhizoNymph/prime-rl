@@ -145,6 +145,11 @@ class _FakePopen:
 
     instances: list["_FakePopen"] = []
     _real_popen = None  # populated by _install_fake_optuna_runtime
+    # Auto-retry test knob: when True, the fake fails the first attempt of
+    # every trial (no ``-r`` suffix in the run dir name) and succeeds on
+    # retries. Stays False for all other tests to keep the existing
+    # success-on-first-attempt behavior.
+    fail_first_attempt: bool = False
 
     def __new__(cls, command, **kwargs):
         if not command or command[0] != "rl-multi-run":
@@ -173,13 +178,19 @@ class _FakePopen:
             if not (run_dir / "control" / "orch.toml").exists():
                 continue
             run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "metrics.jsonl").write_text(
-                json.dumps({"step": 1, "reward": 0.5}) + "\n"
-            )
             (run_dir / "control").mkdir(parents=True, exist_ok=True)
             status_path = run_dir / "status.json"
             status = json.loads(status_path.read_text()) if status_path.exists() else {}
-            code = "1\n" if status.get("state") == "pruned" else "0\n"
+            is_retry = "-r" in run_dir.name.removeprefix("run_")
+            if _FakePopen.fail_first_attempt and not is_retry:
+                # Simulate a transient failure: orchestrator exited non-zero
+                # before producing any metrics.
+                code = "1\n"
+            else:
+                (run_dir / "metrics.jsonl").write_text(
+                    json.dumps({"step": 1, "reward": 0.5}) + "\n"
+                )
+                code = "1\n" if status.get("state") == "pruned" else "0\n"
             (run_dir / "control" / "exit_code").write_text(code)
             self.seen_run_ids.add(run_dir.name)
 
@@ -218,6 +229,7 @@ def _install_fake_optuna_runtime(monkeypatch, study: _StudyStub) -> None:
     monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(multi_run_mod.time, "sleep", lambda *_a, **_kw: None)
     _FakePopen.instances.clear()
+    _FakePopen.fail_first_attempt = False
 
 
 def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
@@ -360,3 +372,64 @@ def test_multi_run_optuna_runs_continuously(tmp_path: Path, monkeypatch) -> None
     for _trial, value, state in study.tells:
         assert state is None
         assert value == 0.5
+
+
+def test_multi_run_optuna_auto_retries_failed_trials(tmp_path: Path, monkeypatch) -> None:
+    """Phase 7d-A: a failed orchestrator with retry budget is re-materialized.
+
+    The first attempt's run dir gets exit_code=1 (no metrics). The controller
+    must materialize ``run_<id>-r1`` with the same params and add it to the
+    live set; the launcher's slot-watch loop picks it up. Optuna sees one ask
+    and one tell with the success value — retries are transparent to the
+    search backend.
+    """
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    # First attempt of every trial fails; the retry succeeds.
+    _FakePopen.fail_first_attempt = True
+
+    config = SweepConfig(
+        name="lora-optuna-retry",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 1, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        retry_budget=1,
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # Optuna sees one logical trial: one ask, one tell with the retry's value.
+    assert len(study.asked) == 1
+    assert len(study.tells) == 1
+    _trial, value, state = study.tells[0]
+    assert state is None
+    assert value == 0.5
+
+    shared_dir = tmp_path / "study" / "shared"
+    materialized = sorted(p.name for p in shared_dir.glob("run_*"))
+    # One initial dir + one retry dir.
+    assert len(materialized) == 2
+    assert any(name.endswith("-r1") for name in materialized)
+
+    # The retry dir's status is completed; the original is failed.
+    initial = next(p for p in shared_dir.glob("run_*") if "-r" not in p.name.removeprefix("run_"))
+    retry = next(p for p in shared_dir.glob("run_*") if "-r1" in p.name)
+    assert json.loads((initial / "status.json").read_text())["state"] == "failed"
+    retry_status = json.loads((retry / "status.json").read_text())
+    assert retry_status["state"] == "completed"
+    assert retry_status["attempts"] == 2
