@@ -1142,13 +1142,37 @@ Phase 7e (shipped):
   The trainer + inference stack and any of *their* completed work is
   preserved; new trials proceed normally on the live trainer.
 
-### Phase 8: SLURM Arrays
+### Phase 8: SLURM Arrays (shipped)
 
-Optimize SLURM submission for large static studies:
-
-- Single array job per static grid/random study.
-- Manifest mapping from array task index to trial ID.
-- Skipped for adaptive strategies because future trials are not known up front.
+- ``SlurmSweepSchedulerConfig.use_array: bool = False``. When enabled,
+  the controller submits a single ``sbatch --array=0-N-1`` job covering
+  every trial in a static (grid/random) sweep instead of one ``sbatch``
+  per trial. The validator rejects ``use_array=True`` with adaptive
+  strategies (Optuna, W&B agent) because the array size must be known
+  up front, and rejects sweeps that try to vary ``slurm.*`` parameters
+  because the array shares one resource block.
+- New ``sweep-array-task`` entrypoint at
+  ``prime_rl.entrypoints.sweep_array_task``. Each array task reads
+  ``$SLURM_ARRAY_TASK_ID``, finds the variant in ``manifest.json``
+  whose ``array_task_index`` matches, and execs the trial's recorded
+  command. Status transitions (running → completed/failed) are written
+  per-task to that variant's ``status.json``; the SLURM ``<job>_<task>``
+  identifier is recorded too.
+- ``submit_trials_to_slurm_array`` (``schedulers.py``) writes
+  ``<study>/array.sbatch`` with SBATCH directives pulled from the first
+  trial's resolved ``[slurm]`` block (partition / gpus_per_node / time /
+  cpus_per_task / mem / etc., plus an ``extra_directives`` passthrough),
+  submits via ``sbatch --parsable`` to capture the array job ID, and
+  flips every targeted artifact to ``state="submitted"`` with the SLURM
+  job ID stamped.
+- Manifest: each variant gets ``array_task_index: int | None``; the
+  manifest gets a top-level ``array_job_id`` after submission so
+  ``sacct``/``squeue`` correlation works.
+- Resume: on ``--resume`` the controller re-submits only indices whose
+  status is *not* completed/submitted, using SLURM's compact range
+  syntax (``--array=2,5,7-10``) via ``compress_array_indices``. A
+  prior submission's already-running tasks aren't disturbed; only
+  pending/failed ones come back into a fresh array job.
 
 ## Decisions
 
