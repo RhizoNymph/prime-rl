@@ -222,6 +222,46 @@ def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
     assert summary["best_value"] == 0.4
 
 
+def test_multi_run_lora_static_fail_fast_writes_done_before_wait(
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
+) -> None:
+    """Static continuous-flow fail-fast exits still signal the launcher."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    fake_multi_run_popen.exit_codes_by_index = {0: 1}
+    fake_multi_run_popen.assert_done_on_wait = True
+
+    config = SweepConfig(
+        name="lora-static-fail-fast",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        retry_budget=0,
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    try:
+        run_sweep(config)
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("Expected SystemExit when static fail-fast trial failed")
+
+    assert (tmp_path / "study" / "shared" / "control" / "done").exists()
+    assert len(fake_multi_run_popen.instances) == 1
+
+
 def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
     tmp_path: Path, monkeypatch, fake_multi_run_popen
 ) -> None:
@@ -262,10 +302,20 @@ def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
     # the resume run does (not the prior run's invocation).
     fake_multi_run_popen.instances = []
 
+    import os
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    shared_dir = tmp_path / "study" / "shared"
+    (shared_dir / ".launcher.pid").write_text(f"{os.getpid()}\n")
+    (shared_dir / ".launcher.heartbeat").touch()
+    monkeypatch.setattr(multi_run_mod, "_wait_for_pid_exit", lambda *_a, **_kw: None)
+
     run_sweep(SweepConfig(**base_kwargs, resume=True))
 
     # No rl-multi-run invocation: every trial was already terminal.
     assert fake_multi_run_popen.instances == []
+    assert (shared_dir / "control" / "done").exists()
 
     manifest_after = json.loads((tmp_path / "study" / "manifest.json").read_text())
     assert manifest_after["summary"]["best_value"] == 0.7

@@ -147,6 +147,17 @@ def _wait_for_launcher_exit(
         _wait_for_pid_exit(existing_pid)
 
 
+def _finish_existing_launcher_if_present(config: SweepConfig, shared_dir: Path) -> None:
+    """On resume with no work left, still tell a live launcher to drain."""
+    if not config.resume:
+        return
+    existing_pid = _detect_running_launcher(shared_dir)
+    if existing_pid is None:
+        return
+    _write_done_marker(shared_dir)
+    _wait_for_launcher_exit(None, existing_pid)
+
+
 @dataclass
 class _LiveTrial:
     """Continuous-flow tracking for one in-flight trial.
@@ -401,6 +412,7 @@ def run_multi_run_optuna_sweep(
     if not live:
         # Every initial materialization failed (or we were already past
         # `total` on resume); nothing to launch.
+        _finish_existing_launcher_if_present(config, shared_dir)
         write_manifest_with_variants(
             config, previous_variants + [build_variant(a) for a in all_artifacts]
         )
@@ -652,6 +664,7 @@ def run_multi_run_static_continuous_sweep(
     if not pending_queue:
         if config.resume:
             print("Resume: every trial already terminal, no new work to launch.")
+        _finish_existing_launcher_if_present(config, shared_dir)
         return failures, tracker
 
     # 1. Initial cohort.
@@ -766,8 +779,8 @@ def run_multi_run_static_continuous_sweep(
 
             time.sleep(poll_interval)
 
-        _write_done_marker(shared_dir)
     finally:
+        _write_done_marker(shared_dir)
         _wait_for_launcher_exit(proc, existing_pid)
 
     write_manifest_with_variants(config, [build_variant(a) for a in artifacts])
