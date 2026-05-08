@@ -1093,20 +1093,26 @@ Phase 7c (shipped):
   real time. Default mode is unchanged: without ``--watch-slots`` the
   launcher waits for the initial cohort to finish and exits.
 
-Deferred to Phase 7d:
+Phase 7d (shipped):
+
+- **Auto-retry for failed orchestrators (7d-A).** A failed trial
+  whose ``attempts < retry_budget + 1`` is re-materialized into a
+  fresh ``run_<id>-r<N>`` directory with the same params and added
+  back to the live set; the launcher's ``--watch-slots`` loop picks
+  it up just like a brand-new trial. The original failed dir's
+  status stays as ``failed`` for history; the retry's status carries
+  the authoritative outcome. Optuna sees one ask and one ``study.tell``
+  per logical trial regardless of how many retries it took, so the
+  search backend's view stays clean.
+
+Deferred to Phase 7e (or later):
 
 - **Live-attach resume.** Controller resuming against a *still-running*
   trainer torchrun (a different process from the controller that
   owned the prior sweep). Needs PID file at
   ``<shared_dir>/.launcher.pid``, heartbeat freshness check, and a
   hand-off protocol so the new controller can pick up the slot-watch
-  loop. Out of scope for 7c — practical resume covers the
-  controller-crash case where the trainer is dead too.
-- **Auto-retry for failed orchestrators.** A failed trial with
-  ``attempts < retry_budget`` could be re-materialized into a fresh
-  ``run_<id>-r<N>`` dir with the same params. Orthogonal to
-  continuous-flow because it adds a retry-naming axis on top of trial
-  IDs; pulled into a follow-up to keep 7c focused.
+  loop.
 - **Static (grid/random) continuous-flow.** Static mode keeps wave
   semantics with the 7a "max_concurrent_runs >= num_trials" limit.
   Grid sweeps that need streaming concurrency can use Optuna with a
