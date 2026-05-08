@@ -372,3 +372,44 @@ def test_run_sweep_passes_gpu_groups_to_local_scheduler(tmp_path: Path, monkeypa
     run_sweep(config)
 
     assert captured == {"max_parallel": 2, "gpu_groups": [[0, 1], [2, 3]]}
+
+
+def test_run_sweep_dispatches_to_slurm_array_when_use_array(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 8: SlurmSweepSchedulerConfig.use_array=True dispatches to the
+    array submitter, stamps array_task_index per variant, and records the
+    SLURM job id at study level."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    captured: dict = {}
+
+    def fake_array_submit(artifacts, *, study_dir, array_indices=None):
+        captured["count"] = len(artifacts)
+        captured["indices"] = list(array_indices) if array_indices is not None else None
+        captured["study_dir"] = study_dir
+        return "777", array_indices or list(range(len(artifacts)))
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.submit_trials_to_slurm_array", fake_array_submit
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "use_array": True},
+        parameters={"optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+    )
+
+    run_sweep(config)
+
+    assert captured["count"] == 3
+    assert captured["indices"] == [0, 1, 2]
+    assert captured["study_dir"] == tmp_path / "study"
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["array_job_id"] == "777"
+    indices_in_manifest = sorted(v["array_task_index"] for v in manifest["variants"])
+    assert indices_in_manifest == [0, 1, 2]

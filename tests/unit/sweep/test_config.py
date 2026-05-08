@@ -66,6 +66,43 @@ def test_slurm_scheduler_rejects_max_parallel(tmp_path: Path) -> None:
         )
 
 
+def test_slurm_use_array_accepts_grid_strategy(tmp_path: Path) -> None:
+    """Phase 8: SLURM array submission supports static (grid/random) strategies."""
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "use_array": True},
+        parameters={"optim.lr": {"values": [1e-5, 1e-4]}},
+    )
+    assert config.scheduler.use_array is True
+
+
+def test_slurm_use_array_rejects_optuna_strategy(tmp_path: Path) -> None:
+    """Phase 8: array size must be known up front, so adaptive search is out."""
+    with pytest.raises(ValidationError, match="array submission"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "use_array": True},
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={
+                "optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}
+            },
+            objective={"metric": "loss", "direction": "minimize"},
+        )
+
+
+def test_slurm_use_array_rejects_slurm_parameter_paths(tmp_path: Path) -> None:
+    """Phase 8: slurm.* parameters can't vary across array tasks."""
+    with pytest.raises(ValidationError, match="slurm.\\*"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "use_array": True},
+            parameters={"slurm.partition": {"values": ["gpu", "highmem"]}},
+        )
+
+
 def test_sweep_config_requires_base(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="base"):
         SweepConfig(

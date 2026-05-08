@@ -4,11 +4,16 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import tomli_w
 
 from prime_rl.configs.sweep import SweepConfig
 from prime_rl.sweep.materialize import Trial, materialize_trial
-from prime_rl.sweep.schedulers import run_trials_locally
+from prime_rl.sweep.schedulers import (
+    compress_array_indices,
+    run_trials_locally,
+    submit_trials_to_slurm_array,
+)
 
 
 def _materialize(tmp_path: Path, count: int) -> tuple[SweepConfig, list]:
@@ -116,3 +121,129 @@ def test_parallel_run_records_failures_and_continues(tmp_path: Path, monkeypatch
     )
 
     assert failures > 0
+
+
+@pytest.mark.parametrize(
+    "indices,expected",
+    [
+        ([], ""),
+        ([3], "3"),
+        ([0, 1, 2], "0-2"),
+        ([0, 1, 2, 5, 7, 8, 9], "0-2,5,7-9"),
+        ([5, 0, 2, 1], "0-2,5"),  # unsorted input
+        ([0, 0, 1, 1, 2], "0-2"),  # duplicates
+    ],
+)
+def test_compress_array_indices(indices, expected):
+    assert compress_array_indices(indices) == expected
+
+
+def _materialize_with_slurm(tmp_path: Path, count: int, slurm_block: dict) -> list:
+    """Materialize artifacts with a [slurm] block written into each resolved.toml.
+
+    submit_trials_to_slurm_array reads the block from the first artifact's
+    resolved.toml; tests inject a representative one so the rendered sbatch
+    script has expected SBATCH directives.
+    """
+    _, artifacts = _materialize(tmp_path, count=count)
+    for artifact in artifacts:
+        with open(artifact.resolved_path, "rb") as f:
+            import tomli
+
+            resolved = tomli.load(f)
+        resolved["slurm"] = slurm_block
+        with open(artifact.resolved_path, "wb") as f:
+            tomli_w.dump(resolved, f)
+    return artifacts
+
+
+def test_submit_trials_to_slurm_array_writes_sbatch_and_submits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifacts = _materialize_with_slurm(
+        tmp_path,
+        count=4,
+        slurm_block={
+            "partition": "gpu",
+            "gpus_per_node": 4,
+            "time": "01:00:00",
+            "cpus_per_task": 8,
+            "exclusive": True,
+        },
+    )
+    study_dir = tmp_path / "study"
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return SimpleNamespace(returncode=0, stdout="123456;cluster\n", stderr="")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    array_job_id, indices = submit_trials_to_slurm_array(artifacts, study_dir=study_dir)
+
+    assert array_job_id == "123456"
+    assert indices == [0, 1, 2, 3]
+    assert captured["command"][:2] == ["sbatch", "--parsable"]
+
+    sbatch_path = study_dir / "array.sbatch"
+    assert sbatch_path.exists()
+    text = sbatch_path.read_text()
+    assert "#SBATCH --array=0-3" in text
+    assert "#SBATCH --partition=gpu" in text
+    assert "#SBATCH --gpus-per-node=4" in text
+    assert "#SBATCH --time=01:00:00" in text
+    assert "#SBATCH --cpus-per-task=8" in text
+    assert "#SBATCH --exclusive" in text
+    assert "uv run sweep-array-task" in text
+    assert str(study_dir) in text
+
+    # Per-trial status flipped to "submitted" with the SLURM job id.
+    for artifact in artifacts:
+        status = json.loads(artifact.status_path.read_text())
+        assert status["state"] == "submitted"
+        assert status["slurm_job_id"] == "123456"
+
+
+def test_submit_trials_to_slurm_array_filters_to_resume_indices(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifacts = _materialize_with_slurm(tmp_path, count=5, slurm_block={"partition": "gpu"})
+    study_dir = tmp_path / "study"
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = list(command)
+        return SimpleNamespace(returncode=0, stdout="999\n", stderr="")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    array_job_id, indices = submit_trials_to_slurm_array(
+        artifacts, study_dir=study_dir, array_indices=[0, 2, 3]
+    )
+
+    assert array_job_id == "999"
+    assert indices == [0, 2, 3]
+    text = (study_dir / "array.sbatch").read_text()
+    assert "#SBATCH --array=0,2-3" in text
+
+
+def test_submit_trials_to_slurm_array_marks_failed_on_sbatch_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifacts = _materialize_with_slurm(tmp_path, count=2, slurm_block={"partition": "gpu"})
+    study_dir = tmp_path / "study"
+
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="sbatch: error\n")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    array_job_id, indices = submit_trials_to_slurm_array(artifacts, study_dir=study_dir)
+    assert array_job_id is None
+    assert indices == []
+    for artifact in artifacts:
+        status = json.loads(artifact.status_path.read_text())
+        assert status["state"] == "failed"

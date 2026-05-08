@@ -34,6 +34,7 @@ from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import (
     run_trials_locally,
     submit_trials_to_slurm,
+    submit_trials_to_slurm_array,
 )
 from prime_rl.sweep.search import expand_grid, sample_random
 
@@ -44,7 +45,11 @@ def _write_toml(path: Path, data: dict[str, Any]) -> None:
         tomli_w.dump(data, f)
 
 
-def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
+def build_variant(
+    artifact: TrialArtifacts,
+    *,
+    array_task_index: int | None = None,
+) -> dict[str, Any]:
     return {
         "id": artifact.trial.id,
         "label": artifact.trial.label,
@@ -54,6 +59,7 @@ def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
         "status_path": artifact.status_path.as_posix(),
         "resolved_checksum": artifact.resolved_checksum,
         "base_checksums": artifact.base_checksums,
+        "array_task_index": array_task_index,
     }
 
 
@@ -173,6 +179,44 @@ def _build_trial_callback(config: SweepConfig, tracker: TrialOutcomeTracker | No
         return tracker.observe(outcome)
 
     return on_trial_complete
+
+
+def _slurm_array_indices_to_submit(artifacts: list[TrialArtifacts], resume: bool) -> list[int]:
+    """Pick array indices that need submission.
+
+    Phase 8 resume: completed/submitted trials keep their prior array job
+    on the cluster (or already finished); only ``pending`` and ``failed``
+    indices come back into a new submission. Without resume, we submit
+    every index.
+    """
+    if not resume:
+        return list(range(len(artifacts)))
+
+    indices: list[int] = []
+    for index, artifact in enumerate(artifacts):
+        try:
+            status = json.loads(artifact.status_path.read_text())
+        except FileNotFoundError:
+            indices.append(index)
+            continue
+        if status.get("state") in {"completed", "submitted"}:
+            continue
+        indices.append(index)
+    return indices
+
+
+def _record_array_job_id(config: SweepConfig, array_job_id: str | None) -> None:
+    """Stamp the SLURM array job ID at the top of the manifest.
+
+    Lets ``sacct``/``squeue`` correlate post-hoc and, on resume, lets the
+    next controller run know which job already covers prior submissions.
+    """
+    manifest_path = config.output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    manifest["array_job_id"] = array_job_id
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
 def _seed_tracker_from_resume(tracker: TrialOutcomeTracker, artifacts: list[TrialArtifacts]) -> None:
@@ -364,11 +408,38 @@ def run_sweep(config: SweepConfig) -> None:
             on_trial_complete=on_trial_complete,
         )
     elif isinstance(config.scheduler, SlurmSweepSchedulerConfig):
-        failures = submit_trials_to_slurm(
-            artifacts,
-            continue_on_failure=config.continue_on_failure,
-            retry_budget=config.retry_budget,
-        )
+        if config.scheduler.use_array:
+            # Phase 8: one sbatch --array=... covers the whole study. The
+            # array_task_index lives in the manifest so sweep-array-task can
+            # find each variant by index, so re-write the manifest with
+            # indices stamped in *before* submitting.
+            variants_with_index = [
+                build_variant(artifact, array_task_index=index)
+                for index, artifact in enumerate(artifacts)
+            ]
+            write_manifest_with_variants(config, variants_with_index)
+
+            indices_to_submit = _slurm_array_indices_to_submit(artifacts, config.resume)
+            if not indices_to_submit:
+                if config.resume:
+                    print("Resume: every array task already terminal, no new submission.")
+                failures = 0
+            else:
+                array_job_id, submitted = submit_trials_to_slurm_array(
+                    artifacts,
+                    study_dir=config.output_dir,
+                    array_indices=indices_to_submit,
+                )
+                _record_array_job_id(config, array_job_id)
+                failures = 0 if array_job_id is not None else len(submitted) or len(indices_to_submit)
+                if failures > 0 and not config.continue_on_failure:
+                    raise SystemExit(1)
+        else:
+            failures = submit_trials_to_slurm(
+                artifacts,
+                continue_on_failure=config.continue_on_failure,
+                retry_budget=config.retry_budget,
+            )
     else:
         raise ValueError(f"Unsupported sweep scheduler: {config.scheduler}")
 
