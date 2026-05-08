@@ -413,3 +413,139 @@ def test_run_sweep_dispatches_to_slurm_array_when_use_array(
     assert manifest["array_job_id"] == "777"
     indices_in_manifest = sorted(v["array_task_index"] for v in manifest["variants"])
     assert indices_in_manifest == [0, 1, 2]
+
+
+def test_run_sweep_array_resume_skips_indices_still_running_in_squeue(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 8 resume: squeue says tasks 0,1 still alive on the prior array
+    job; resume must not re-submit them. Only the failed/pending indices
+    that aren't still on the cluster come back in a fresh sbatch."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    config_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "use_array": True},
+        parameters={"optim.lr": {"values": [1e-5, 3e-5, 1e-4, 5e-5]}},
+    )
+
+    # Run 1: submit the initial array (job id "111"). Stash for run 2.
+    initial_call: dict = {}
+
+    def fake_array_submit_initial(artifacts, *, study_dir, array_indices=None):
+        initial_call["indices"] = list(array_indices) if array_indices is not None else None
+        return "111", array_indices or list(range(len(artifacts)))
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.submit_trials_to_slurm_array", fake_array_submit_initial
+    )
+    run_sweep(SweepConfig(**config_kwargs))
+
+    assert initial_call["indices"] == [0, 1, 2, 3]
+
+    # Mutate prior status.json: trials 0,1 are state=running on the cluster
+    # (mid-execution), trial 2 completed, trial 3 failed.
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    by_idx = {v["array_task_index"]: Path(v["status_path"]) for v in manifest["variants"]}
+    states = {0: "running", 1: "running", 2: "completed", 3: "failed"}
+    for idx, state in states.items():
+        status_path = by_idx[idx]
+        s = json.loads(status_path.read_text())
+        s["state"] = state
+        status_path.write_text(json.dumps(s, indent=2, sort_keys=True) + "\n")
+
+    # Run 2 (resume): squeue claims tasks 0 and 1 are still pending/running on
+    # job 111. Index 3 (failed) is no longer on the cluster and should be
+    # the only one re-submitted.
+    resume_call: dict = {}
+
+    def fake_array_submit_resume(artifacts, *, study_dir, array_indices=None):
+        resume_call["indices"] = list(array_indices) if array_indices is not None else None
+        return "222", array_indices or list(range(len(artifacts)))
+
+    def fake_squeue(command, **kwargs):
+        from types import SimpleNamespace
+
+        if command[:1] == ["squeue"]:
+            assert "111" in command  # querying the prior job
+            return SimpleNamespace(returncode=0, stdout="0\n1\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.submit_trials_to_slurm_array", fake_array_submit_resume
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_squeue)
+
+    run_sweep(SweepConfig(**config_kwargs, resume=True))
+
+    # Index 0,1 still live on cluster → skip. Index 2 completed → skip.
+    # Index 3 failed and not in squeue → resubmit.
+    assert resume_call["indices"] == [3]
+
+    # The prior array_job_id ("111") gets overwritten by the new submission's
+    # ("222") because there *was* a new submission this run.
+    manifest_after = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest_after["array_job_id"] == "222"
+
+
+def test_run_sweep_array_resume_preserves_array_job_id_when_nothing_to_submit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 8 resume: every task either completed or still running on the
+    prior array job → no new sbatch. The prior array_job_id must survive
+    the resume's manifest rewrite so squeue can still find the job later."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    config_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "use_array": True},
+        parameters={"optim.lr": {"values": [1e-5, 3e-5]}},
+    )
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.submit_trials_to_slurm_array",
+        lambda artifacts, *, study_dir, array_indices=None: (
+            "555",
+            array_indices or list(range(len(artifacts))),
+        ),
+    )
+    run_sweep(SweepConfig(**config_kwargs))
+
+    # Mark trial 0 completed, trial 1 still running on cluster.
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    by_idx = {v["array_task_index"]: Path(v["status_path"]) for v in manifest["variants"]}
+    for idx, state in {0: "completed", 1: "running"}.items():
+        s = json.loads(by_idx[idx].read_text())
+        s["state"] = state
+        by_idx[idx].write_text(json.dumps(s, indent=2, sort_keys=True) + "\n")
+
+    submitted: list = []
+
+    def fake_array_submit_should_not_be_called(*args, **kwargs):
+        submitted.append(args)
+        raise AssertionError("submit_trials_to_slurm_array should not run when nothing to submit")
+
+    def fake_squeue(command, **kwargs):
+        from types import SimpleNamespace
+
+        if command[:1] == ["squeue"]:
+            return SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.controller.submit_trials_to_slurm_array",
+        fake_array_submit_should_not_be_called,
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_squeue)
+
+    run_sweep(SweepConfig(**config_kwargs, resume=True))
+    assert submitted == []
+
+    manifest_after = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest_after["array_job_id"] == "555"

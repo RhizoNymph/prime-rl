@@ -228,6 +228,57 @@ def compress_array_indices(indices: list[int]) -> str:
     return ",".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs)
 
 
+def query_running_array_tasks(array_job_id: str | None) -> set[int]:
+    """Return the array task indices still pending or running in SLURM.
+
+    Phase 8 resume: when the prior controller's ``sbatch`` is still
+    scheduling/running tasks, those tasks must NOT be re-submitted into a
+    fresh array job. We query ``squeue`` once at resume time to learn which
+    indices the cluster still owns and skip them.
+
+    Empty array job ID, ``squeue`` failure, or a missing binary all return
+    an empty set — the caller falls back to the conservative
+    "resubmit-by-status" behavior, which over-submits rather than dropping
+    work. Surfacing the squeue error inline would be noisier without
+    making the answer better.
+    """
+    if not array_job_id:
+        return set()
+    try:
+        result = subprocess.run(
+            ["squeue", "-j", array_job_id, "-h", "-t", "pending,running", "-o", "%a"],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, FileNotFoundError):
+        return set()
+    if result.returncode != 0:
+        return set()
+    indices: set[int] = set()
+    for line in (result.stdout or "").splitlines():
+        token = line.strip()
+        if not token:
+            continue
+        # %a is usually a single int per row, but SLURM can show ranges
+        # (e.g. "3-5") or comma-lists ("3,5,7") for batched array states.
+        for piece in token.split(","):
+            piece = piece.strip()
+            if "-" in piece:
+                start_str, _, end_str = piece.partition("-")
+                try:
+                    start, end = int(start_str), int(end_str)
+                except ValueError:
+                    continue
+                if start <= end:
+                    indices.update(range(start, end + 1))
+            else:
+                try:
+                    indices.add(int(piece))
+                except ValueError:
+                    continue
+    return indices
+
+
 def _read_slurm_block_from_resolved(resolved_path: Path) -> dict:
     """Pull the [slurm] block out of a resolved trial config.
 

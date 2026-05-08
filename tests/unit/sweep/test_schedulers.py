@@ -11,6 +11,7 @@ from prime_rl.configs.sweep import SweepConfig
 from prime_rl.sweep.materialize import Trial, materialize_trial
 from prime_rl.sweep.schedulers import (
     compress_array_indices,
+    query_running_array_tasks,
     run_trials_locally,
     submit_trials_to_slurm_array,
 )
@@ -247,3 +248,46 @@ def test_submit_trials_to_slurm_array_marks_failed_on_sbatch_error(
     for artifact in artifacts:
         status = json.loads(artifact.status_path.read_text())
         assert status["state"] == "failed"
+
+
+def test_query_running_array_tasks_parses_squeue_output(monkeypatch) -> None:
+    def fake_run(command, **kwargs):
+        assert command[:3] == ["squeue", "-j", "999"]
+        return SimpleNamespace(returncode=0, stdout="0\n3\n7\n", stderr="")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    assert query_running_array_tasks("999") == {0, 3, 7}
+
+
+def test_query_running_array_tasks_handles_ranges_and_lists(monkeypatch) -> None:
+    """SLURM may collapse pending tasks into ranges or comma-lists."""
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="0-2\n5,7\n", stderr="")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    assert query_running_array_tasks("999") == {0, 1, 2, 5, 7}
+
+
+def test_query_running_array_tasks_returns_empty_on_squeue_failure(monkeypatch) -> None:
+    """squeue not installed / failing → empty set, caller falls back to status."""
+    def fake_run(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="squeue: error\n")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+    assert query_running_array_tasks("999") == set()
+
+
+def test_query_running_array_tasks_returns_empty_when_binary_missing(monkeypatch) -> None:
+    def fake_run(command, **kwargs):
+        raise FileNotFoundError("squeue not found")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+    assert query_running_array_tasks("999") == set()
+
+
+def test_query_running_array_tasks_returns_empty_when_no_job_id() -> None:
+    """No prior job → no live tasks, period; don't even shell out."""
+    assert query_running_array_tasks(None) == set()
+    assert query_running_array_tasks("") == set()
