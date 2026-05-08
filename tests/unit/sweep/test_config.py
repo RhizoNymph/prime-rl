@@ -8,6 +8,7 @@ from prime_rl.configs.sweep import (
     ChoiceParameterConfig,
     IntUniformParameterConfig,
     LogUniformParameterConfig,
+    OptunaStrategyConfig,
     RandomStrategyConfig,
     SweepConfig,
     UniformParameterConfig,
@@ -297,3 +298,72 @@ def test_early_stopping_threshold_parses(tmp_path: Path) -> None:
     assert config.early_stopping.type == "threshold"
     assert config.early_stopping.threshold == 5.0
     assert config.early_stopping.min_trials == 2
+
+
+def test_optuna_strategy_requires_objective(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Optuna strategy requires an objective"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        )
+
+
+def test_optuna_strategy_rejects_slurm_scheduler(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Optuna strategy is not supported with the SLURM"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm"},
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
+def test_optuna_strategy_resume_requires_storage(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="strategy.storage"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+            resume=True,
+        )
+
+
+def test_optuna_strategy_rejects_max_parallel_gt_one(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="Optuna strategy runs sequentially"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={
+                "type": "local",
+                "max_parallel": 2,
+                "gpu_assignment": {"visible_devices": [[0], [1]]},
+            },
+            strategy={"type": "optuna", "num_trials": 4},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
+def test_optuna_strategy_parses_with_storage(tmp_path: Path) -> None:
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 4,
+            "sampler": "random",
+            "seed": 42,
+            "storage": "sqlite:///optuna.db",
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert isinstance(config.strategy, OptunaStrategyConfig)
+    assert config.strategy.sampler == "random"
+    assert config.strategy.storage == "sqlite:///optuna.db"

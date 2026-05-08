@@ -937,12 +937,25 @@ Add:
 
 ### Phase 5: Optuna and Hyperband/ASHA
 
-Add:
+Phase 5a (this branch):
 
 - Optional Optuna integration via the `prime-rl[hpo]` extra.
-- TPE/random samplers.
-- Median, ASHA, and Hyperband pruning through Optuna.
-- Intermediate metric reporting from the controller.
+- `OptunaStrategyConfig` with TPE / Random samplers, optional SQLAlchemy
+  storage URL, `seed`, and `study_name`.
+- Sequential ask/tell driver: the controller asks Optuna for one parameter
+  set at a time, materializes a trial, runs it through the existing
+  scheduler primitives, and tells Optuna the final objective before the
+  next ask. Failures and `None` objectives report `TrialState.FAIL`.
+- Resume requires `strategy.storage` (in-memory studies vanish on exit).
+  Optuna is rejected with the SLURM scheduler since the controller must
+  observe each trial before proposing the next.
+
+Deferred to Phase 5b:
+
+- Median / ASHA / Hyperband pruners through Optuna (currently ``pruner =
+  "none"`` is the only accepted value).
+- Intermediate metric reporting from the controller (W&B step-indexed
+  history / Prime Monitor fallback).
 
 ### Phase 6: W&B Sweep Agent Integration
 

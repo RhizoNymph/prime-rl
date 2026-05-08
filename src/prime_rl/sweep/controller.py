@@ -9,13 +9,15 @@ import tomli_w
 from prime_rl.configs.sweep import (
     GridStrategyConfig,
     LocalSweepSchedulerConfig,
+    OptunaStrategyConfig,
     RandomStrategyConfig,
     SlurmSweepSchedulerConfig,
     SweepConfig,
 )
 from prime_rl.sweep.early_stopping import TrialOutcome, TrialOutcomeTracker
-from prime_rl.sweep.materialize import Trial, TrialArtifacts, materialize_trial, write_json
+from prime_rl.sweep.materialize import Trial, TrialArtifacts, materialize_trial, record_trial_objective
 from prime_rl.sweep.metrics import read_final_summary
+from prime_rl.sweep.optuna_loop import run_optuna_sweep
 from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import run_trials_locally, submit_trials_to_slurm
 from prime_rl.sweep.search import expand_grid, sample_random
@@ -27,22 +29,20 @@ def _write_toml(path: Path, data: dict[str, Any]) -> None:
         tomli_w.dump(data, f)
 
 
-def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> None:
-    variants = []
-    for artifact in artifacts:
-        variants.append(
-            {
-                "id": artifact.trial.id,
-                "label": artifact.trial.label,
-                "output_dir": artifact.run_dir.as_posix(),
-                "overrides": artifact.trial.parameters,
-                "command": artifact.command,
-                "status_path": artifact.status_path.as_posix(),
-                "resolved_checksum": artifact.resolved_checksum,
-                "base_checksums": artifact.base_checksums,
-            }
-        )
+def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
+    return {
+        "id": artifact.trial.id,
+        "label": artifact.trial.label,
+        "output_dir": artifact.run_dir.as_posix(),
+        "overrides": artifact.trial.parameters,
+        "command": artifact.command,
+        "status_path": artifact.status_path.as_posix(),
+        "resolved_checksum": artifact.resolved_checksum,
+        "base_checksums": artifact.base_checksums,
+    }
 
+
+def write_manifest_with_variants(config: SweepConfig, variants: list[dict[str, Any]]) -> None:
     manifest = {
         "name": config.name,
         "entrypoint": config.entrypoint,
@@ -54,6 +54,10 @@ def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> Non
         "variants": variants,
     }
     (config.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _write_manifest(config: SweepConfig, artifacts: list[TrialArtifacts]) -> None:
+    write_manifest_with_variants(config, [build_variant(a) for a in artifacts])
 
 
 def _update_manifest_summary(config: SweepConfig, summary: dict[str, Any] | None) -> None:
@@ -108,12 +112,6 @@ def _materialize_study(config: SweepConfig) -> list[TrialArtifacts]:
     return artifacts
 
 
-def _record_objective(artifact: TrialArtifacts, value: float | None) -> None:
-    status = json.loads(artifact.status_path.read_text())
-    status["objective"] = value
-    write_json(artifact.status_path, status)
-
-
 def _build_trial_callback(config: SweepConfig, tracker: TrialOutcomeTracker | None):
     if config.objective is None or tracker is None:
         return None
@@ -122,7 +120,7 @@ def _build_trial_callback(config: SweepConfig, tracker: TrialOutcomeTracker | No
 
     def on_trial_complete(artifact: TrialArtifacts, returncode: int) -> bool:
         objective = read_final_summary(artifact.run_dir, metric) if returncode == 0 else None
-        _record_objective(artifact, objective)
+        record_trial_objective(artifact.status_path, objective)
         outcome = TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
         return tracker.observe(outcome)
 
@@ -148,7 +146,44 @@ def _seed_tracker_from_resume(tracker: TrialOutcomeTracker, artifacts: list[Tria
         tracker.observe(outcome)
 
 
+def _run_optuna(config: SweepConfig) -> None:
+    if config.output_dir.exists() and config.clean_output_dir:
+        shutil.rmtree(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
+
+    if config.dry_run:
+        print(
+            f"Dry run for Optuna strategy is a no-op: trials are proposed sequentially based on "
+            f"prior objectives, so they cannot be materialized up front."
+        )
+        return
+
+    failures, tracker, artifacts = run_optuna_sweep(
+        config,
+        write_manifest_with_variants=write_manifest_with_variants,
+        build_variant=build_variant,
+    )
+
+    if tracker is not None:
+        summary = asdict(tracker.summary())
+        _update_manifest_summary(config, summary)
+        if summary["best_trial_id"] is not None:
+            label = tracker.best_label or summary["best_trial_id"]
+            print(f"Best trial: {label} ({summary['best_value']})")
+        if summary["halted_by_early_stopping"]:
+            print(f"Sweep halted by early stopping ({summary['halt_reason']}).")
+
+    if failures > 0:
+        print(f"Sweep finished with {failures} failed trial(s) out of {len(artifacts)}.")
+        raise SystemExit(1)
+
+
 def run_sweep(config: SweepConfig) -> None:
+    if isinstance(config.strategy, OptunaStrategyConfig):
+        _run_optuna(config)
+        return
+
     artifacts = _materialize_study(config)
 
     if config.dry_run:

@@ -100,8 +100,32 @@ class RandomStrategyConfig(BaseConfig):
     seed: Annotated[int | None, Field(description="Optional seed for reproducibility.")] = None
 
 
+class OptunaStrategyConfig(BaseConfig):
+    """Adaptive sampling backed by Optuna (TPE / Random samplers).
+
+    Pruners (median, asha, hyperband) are reserved for a follow-up phase that
+    adds intermediate-metric reporting; only ``"none"`` is accepted today.
+    Storage defaults to in-memory; pass a SQLAlchemy URL (e.g.
+    ``"sqlite:///optuna.db"``) to persist the study across resume.
+    """
+
+    type: Literal["optuna"] = "optuna"
+    num_trials: Annotated[int, Field(ge=1, description="Number of trials to evaluate.")]
+    seed: int | None = None
+    sampler: Literal["tpe", "random"] = "tpe"
+    pruner: Literal["none"] = "none"
+    storage: Annotated[
+        str | None,
+        Field(description="SQLAlchemy storage URL for study persistence; in-memory if unset."),
+    ] = None
+    study_name: Annotated[
+        str | None,
+        Field(description="Optuna study_name; defaults to the sweep name."),
+    ] = None
+
+
 SearchStrategyConfig: TypeAlias = Annotated[
-    GridStrategyConfig | RandomStrategyConfig,
+    GridStrategyConfig | RandomStrategyConfig | OptunaStrategyConfig,
     Field(discriminator="type"),
 ]
 
@@ -286,4 +310,22 @@ class SweepConfig(BaseConfig):
                 "early_stopping is not supported with the SLURM scheduler: the controller submits "
                 "jobs and exits, so it never observes trial completion to decide when to halt."
             )
+        if isinstance(self.strategy, OptunaStrategyConfig):
+            if self.objective is None:
+                raise ValueError("Optuna strategy requires an objective to optimize.")
+            if isinstance(self.scheduler, SlurmSweepSchedulerConfig):
+                raise ValueError(
+                    "Optuna strategy is not supported with the SLURM scheduler: the controller "
+                    "must observe each trial's objective before proposing the next one."
+                )
+            if isinstance(self.scheduler, LocalSweepSchedulerConfig) and self.scheduler.max_parallel > 1:
+                raise ValueError(
+                    "Optuna strategy runs sequentially (ask/tell needs each trial's objective "
+                    "before proposing the next), so scheduler.max_parallel must be 1."
+                )
+            if self.resume and self.strategy.storage is None:
+                raise ValueError(
+                    "Resume with the Optuna strategy requires strategy.storage so the study "
+                    "can be reloaded; in-memory studies vanish when the controller exits."
+                )
         return self
