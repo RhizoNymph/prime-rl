@@ -46,6 +46,7 @@ from prime_rl.entrypoints.rl import (
 )
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
+from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 from prime_rl.utils.process import cleanup_processes, cleanup_threads, set_proc_title
 from prime_rl.utils.utils import get_log_dir
 
@@ -189,6 +190,10 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
                     wandb_shared_env=wandb_shared_env,
                     wandb_program="uv run rl-multi-run",
                     supervisor=supervisor,
+                    # Per-run sweep sidecar metrics, so the controller can
+                    # read this trial's objective from <run_dir>/metrics.jsonl
+                    # without colliding with sibling orchestrators.
+                    extra_env={SWEEP_METRICS_JSONL_ENV: (run_dir / "metrics.jsonl").as_posix()},
                 )
             )
 

@@ -149,12 +149,16 @@ def start_orchestrator(
     wandb_shared_env: dict[str, str],
     wandb_program: str,
     supervisor: LaunchSupervisor,
+    extra_env: dict[str, str] | None = None,
 ) -> Popen:
     """Spawn an orchestrator subprocess pointed at ``config_path``.
 
     Single-run mode passes ``label="orchestrator"``. Multi-run mode passes a
     per-run label like ``"orchestrator-0000-abc"`` so the supervisor's
-    ``stop_events`` and the W&B label can be told apart.
+    ``stop_events`` and the W&B label can be told apart. ``extra_env`` is
+    layered on top of the default env (after WANDB_*) so callers can scope
+    per-orchestrator env vars like ``PRIME_RL_SWEEP_METRICS_JSONL`` without
+    leaking them into sibling orchestrators.
     """
     cmd = ["orchestrator", "@", config_path.as_posix()]
     env = {
@@ -165,6 +169,8 @@ def start_orchestrator(
         "WANDB_PROGRAM": wandb_program,
         "WANDB_ARGS": json.dumps(start_command),
     }
+    if extra_env:
+        env.update(extra_env)
     supervisor.logger.info(f"Starting {label} process")
     supervisor.logger.debug(f"{label} start command: {' '.join(cmd)}")
     return _start_supervised(label, cmd, env, log_path, supervisor)
