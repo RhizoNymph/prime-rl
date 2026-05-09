@@ -153,14 +153,13 @@ monkey_patch_harmony_stop_token_propagation()
 # May be removable if we pass load_inplace=True (supported since vLLM 0.18, PR #31326)
 monkey_patch_load_lora_adapter()
 # NOTE: Monkeypatch TokenizeParams to fix overly conservative validation
-# Still needed in vLLM 0.19 — upstream rejects prompt_len > max_model_len - max_tokens
+# Still needed in vLLM 0.20 — upstream rejects prompt_len > max_model_len - max_tokens
 monkey_patch_tokenize_params_validation()
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
 # Create our own router for custom endpoints
 router = APIRouter()
-LIVENESS_TIMEOUT_SECONDS = 5.0
 
 
 def engine_client(request: Request) -> EngineClient:
@@ -272,7 +271,7 @@ async def liveness(raw_request: Request):
     try:
         await asyncio.wait_for(
             engine_client(raw_request).collective_rpc("liveness_probe"),
-            timeout=LIVENESS_TIMEOUT_SECONDS,
+            timeout=raw_request.app.state.liveness_timeout_seconds,
         )
     except asyncio.TimeoutError:
         return JSONResponse({"status": "engine_unresponsive"}, status_code=503)
@@ -312,6 +311,7 @@ async def custom_init_app_state(
     await init_app_state(engine_client, state, args, supported_tasks)
 
     state.reset_prefix_cache_after_update = getattr(args, "reset_prefix_cache_after_update", True)
+    state.liveness_timeout_seconds = args.liveness_timeout_seconds
 
     # TITO: server-side chat templating + token IDs.
     if "generate" in supported_tasks and state.openai_serving_chat is not None:

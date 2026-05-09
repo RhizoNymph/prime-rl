@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_config import BaseConfig
 
 from prime_rl.configs.shared import BaseModelConfig, SlurmConfig
-from prime_rl.utils.utils import rgetattr, rsetattr
+from prime_rl.utils.config import find_package_resource, rgetattr, rsetattr
 
 # TODO: Set thinking/ solution budget
 
@@ -16,6 +16,16 @@ class ServerConfig(BaseConfig):
 
     host: Annotated[str | None, Field(description="The host to bind to.")] = None
     port: Annotated[int, Field(description="The port to bind to.")] = 8000
+    liveness_timeout_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            description=(
+                "Timeout in seconds for the /liveness endpoint's internal vLLM worker RPC. "
+                "If Kubernetes liveness probes are enabled, keep the probe timeoutSeconds at least this high."
+            ),
+        ),
+    ] = 30.0
 
 
 class ParallelConfig(BaseConfig):
@@ -390,6 +400,13 @@ class InferenceConfig(BaseConfig):
         ),
     ] = False
 
+    enable_fp32_lm_head: Annotated[
+        bool,
+        Field(
+            description="Run the lm_head projection in fp32 via a native bf16xbf16 -> fp32 GEMM (`torch.mm` with `out_dtype=torch.float32`). Stabilizes logprob precision under FP8/bf16 inference, matching SGLang's `--enable-fp32-lm-head`. Implemented as a monkey-patch over vLLM's LogitsProcessor, activated by setting `additional_config[\"fp32_lm_head\"] = True` on the vLLM config.",
+        ),
+    ] = False
+
     vllm_extra: Annotated[
         dict[str, Any],
         Field(
@@ -450,10 +467,9 @@ class InferenceConfig(BaseConfig):
     @model_validator(mode="after")
     def auto_setup_slurm_template(self):
         if self.slurm is not None and self.slurm.template_path is None:
-            import prime_rl
-
-            templates_dir = Path(prime_rl.__file__).parent / "templates"
-            self.slurm.template_path = templates_dir / "inference.sbatch.j2"
+            templates_dir = find_package_resource("templates")
+            if templates_dir is not None:
+                self.slurm.template_path = templates_dir / "inference.sbatch.j2"
         return self
 
     @model_validator(mode="after")
@@ -500,6 +516,7 @@ class InferenceConfig(BaseConfig):
         to_vllm = {
             "server.host": "host",
             "server.port": "port",
+            "server.liveness_timeout_seconds": "liveness_timeout_seconds",
             "model.name": "model",
             "model.dtype": "dtype",
             "model.max_model_len": "max_model_len",
@@ -535,6 +552,13 @@ class InferenceConfig(BaseConfig):
 
         # Set `logprobs_mode` to `processed_logprobs` by default
         rsetattr(namespace, "logprobs_mode", "processed_logprobs")
+
+        # Pass prime-rl-specific flags through vLLM's additional_config dict;
+        # workers read these via get_current_vllm_config().additional_config.
+        if self.enable_fp32_lm_head:
+            existing = getattr(namespace, "additional_config", None) or {}
+            existing["fp32_lm_head"] = True
+            rsetattr(namespace, "additional_config", existing)
 
         # Remove chat_template if not set (vLLM doesn't accept None)
         if namespace.chat_template is None:

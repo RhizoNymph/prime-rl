@@ -7,6 +7,7 @@ from pathlib import Path
 import pynvml
 import tomli_w
 
+import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive import
 from prime_rl.configs.rl import RLConfig
 from prime_rl.entrypoints.launch import (
     LaunchSupervisor,
