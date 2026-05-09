@@ -97,6 +97,57 @@ def build_wandb_shared_env(config: RLConfig) -> dict[str, str]:
     return env
 
 
+def init_wandb_shared_primary(
+    config: RLConfig,
+    wandb_shared_env: dict[str, str],
+    logger: Any | None = None,
+) -> Any | None:
+    """Open the shared W&B run from the launcher process as primary.
+
+    The launcher outlives every subprocess (trainer + orchestrators), so
+    binding ``x_update_finish_state`` to its lifetime is the only way to
+    guarantee the shared run finishes after every late metric has flushed.
+    A primary trainer would mark the run finished at ``max_steps`` while
+    orchestrators are still emitting final-eval logs; a primary orchestrator
+    would do the same if pruned. Returns the wandb ``Run`` so the caller
+    can ``finish()`` it; returns ``None`` when shared mode is off.
+    """
+    if wandb_shared_env.get("WANDB_SHARED_MODE") != "1":
+        return None
+    if config.wandb is None:
+        return None
+
+    import wandb
+    from wandb.errors import CommError
+
+    run_id = wandb_shared_env["WANDB_SHARED_RUN_ID"]
+    settings = wandb.Settings(
+        mode="shared",
+        x_label="launcher",
+        x_primary=True,
+        x_update_finish_state=True,
+    )
+    for attempt in range(5):
+        try:
+            return wandb.init(
+                id=run_id,
+                project=config.wandb.project,
+                entity=config.wandb.entity,
+                name=config.wandb.name,
+                group=config.wandb.group,
+                tags=config.wandb.tags,
+                settings=settings,
+            )
+        except CommError as e:
+            if attempt == 4:
+                raise
+            if logger is not None:
+                logger.info(f"Transient W&B init error ({e}) - retrying in 10s ({attempt + 1}/5)")
+            time.sleep(10)
+
+    raise RuntimeError("unreachable")
+
+
 def _start_supervised(
     label: str,
     cmd: list[str],
@@ -165,6 +216,7 @@ def start_orchestrator(
         **os.environ,
         **wandb_shared_env,
         "WANDB_SHARED_LABEL": label,
+        "WANDB_SHARED_PRIMARY": "0",
         "LOGURU_FORCE_COLORS": "1",
         "WANDB_PROGRAM": wandb_program,
         "WANDB_ARGS": json.dumps(start_command),
@@ -208,6 +260,7 @@ def start_trainer(
         **os.environ,
         **wandb_shared_env,
         "WANDB_SHARED_LABEL": "trainer",
+        "WANDB_SHARED_PRIMARY": "0",
         "CUDA_VISIBLE_DEVICES": ",".join(map(str, gpu_ids)),
         "PYTHONUNBUFFERED": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
