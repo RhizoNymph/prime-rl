@@ -71,12 +71,14 @@ class _LiveTrial:
     continuous-flow needs random-access lookups by ``run_dir`` because slots
     free in arbitrary order, so we group every per-trial bookkeeping field
     here. ``last_step`` is the highest metrics.jsonl step we've already
-    forwarded to Optuna.
+    forwarded to Optuna; ``attempts`` is the 1-based attempt count for
+    auto-retry — incremented when a failed trial is re-materialized.
     """
 
     optuna_trial: Any  # optuna.Trial; typed loosely to avoid an unconditional import
     artifact: TrialArtifacts
     last_step: int | None = None
+    attempts: int = 1
 
 
 def prune_run(
@@ -192,18 +194,18 @@ def _process_pruning_signal(
         )
 
 
-def _settle_finished_trial(
-    optuna: Any,
-    study: Any,
+def _reconcile_trial_state(
     live_trial: _LiveTrial,
     metric: str,
 ) -> tuple[str, float | None]:
-    """Reconcile one finished trial and tell Optuna its result.
+    """Reconcile one finished trial without telling Optuna.
 
     Returns ``(state, objective)`` where ``state`` is ``"completed"``,
     ``"pruned"``, or ``"failed"`` and ``objective`` is the recorded value
     (``None`` for non-completed states or for completed runs whose metric
-    never showed up).
+    never showed up). The caller decides whether the outcome is final
+    (call ``study.tell``) or whether to retry (re-materialize and skip
+    the tell).
     """
     state = reconcile_multi_run_artifact(
         live_trial.artifact, aggregate_returncode=0, finished_at=utc_now()
@@ -214,17 +216,31 @@ def _settle_finished_trial(
         objective = read_final_summary(live_trial.artifact.run_dir, metric)
         record_trial_objective(live_trial.artifact.status_path, objective)
         if objective is None:
-            study.tell(live_trial.optuna_trial, state=optuna.trial.TrialState.FAIL)
+            # Clean exit but the metric never showed up — the orchestrator
+            # produced no usable result. Treat as a failure so the retry /
+            # FAIL branch gets a chance instead of telling Optuna a number
+            # the sampler can't actually use.
             state = "failed"
-        else:
-            study.tell(live_trial.optuna_trial, objective)
-    elif state == "pruned":
-        study.tell(live_trial.optuna_trial, state=optuna.trial.TrialState.PRUNED)
-    else:  # failed
+    elif state == "failed":
         record_trial_objective(live_trial.artifact.status_path, None)
-        study.tell(live_trial.optuna_trial, state=optuna.trial.TrialState.FAIL)
 
     return state, objective
+
+
+def _tell_final_outcome(
+    optuna: Any,
+    study: Any,
+    live_trial: _LiveTrial,
+    state: str,
+    objective: float | None,
+) -> None:
+    """Forward the final outcome to Optuna once the trial is past retry."""
+    if state == "completed" and objective is not None:
+        study.tell(live_trial.optuna_trial, objective)
+    elif state == "pruned":
+        study.tell(live_trial.optuna_trial, state=optuna.trial.TrialState.PRUNED)
+    else:  # failed (or completed with no objective — collapsed to failed in _reconcile_trial_state)
+        study.tell(live_trial.optuna_trial, state=optuna.trial.TrialState.FAIL)
 
 
 def run_multi_run_optuna_sweep(
@@ -327,10 +343,13 @@ def run_multi_run_optuna_sweep(
         while live:
             if proc.poll() is not None:
                 # Launcher died unexpectedly. Settle whatever's still alive
-                # so Optuna's view doesn't have RUNNING trials hanging.
+                # so Optuna's view doesn't have RUNNING trials hanging. No
+                # retries on this path: the trainer is gone, retrying would
+                # need us to re-spawn the entire stack.
                 for live_trial in list(live.values()):
-                    state, objective = _settle_finished_trial(optuna, study, live_trial, metric)
-                    if state in ("failed",):
+                    state, objective = _reconcile_trial_state(live_trial, metric)
+                    _tell_final_outcome(optuna, study, live_trial, state, objective)
+                    if state == "failed":
                         failures += 1
                     tracker.observe(
                         TrialOutcome(
@@ -352,7 +371,52 @@ def run_multi_run_optuna_sweep(
                 if not _exit_code_path(run_dir).exists():
                     continue
 
-                state, objective = _settle_finished_trial(optuna, study, live_trial, metric)
+                state, objective = _reconcile_trial_state(live_trial, metric)
+
+                # Auto-retry: a transient failure with budget left re-uses
+                # the same Optuna trial (same params) but materializes a
+                # fresh run_<id>-r<N> dir the launcher's slot-watch loop
+                # picks up. Optuna sees this as one logical trial; only
+                # the final outcome is told.
+                if (
+                    state == "failed"
+                    and live_trial.attempts < config.retry_budget + 1
+                ):
+                    new_attempt = live_trial.attempts + 1
+                    try:
+                        retry_artifact = materialize_multi_run_trial(
+                            config, live_trial.artifact.trial, scheduler, attempt=new_attempt - 1
+                        )
+                    except Exception as exc:
+                        # Materialization shouldn't fail at retry time
+                        # (params already validated), but if it does fall
+                        # through to the final-FAIL branch.
+                        print(
+                            f"Optuna trial {live_trial.artifact.trial.id} retry "
+                            f"{new_attempt} failed materialization: {exc}"
+                        )
+                    else:
+                        all_artifacts.append(retry_artifact)
+                        _write_status(
+                            retry_artifact,
+                            state="running",
+                            started_at=utc_now(),
+                            attempts=new_attempt,
+                            gpu_group=None,
+                        )
+                        live.pop(run_dir)
+                        live[retry_artifact.run_dir] = _LiveTrial(
+                            optuna_trial=live_trial.optuna_trial,
+                            artifact=retry_artifact,
+                            attempts=new_attempt,
+                        )
+                        write_manifest_with_variants(
+                            config,
+                            previous_variants + [build_variant(a) for a in all_artifacts],
+                        )
+                        continue
+
+                _tell_final_outcome(optuna, study, live_trial, state, objective)
                 if state == "failed":
                     failures += 1
                     if not config.continue_on_failure:
