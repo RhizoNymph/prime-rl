@@ -199,6 +199,240 @@ def run_trials_locally(
     )
 
 
+def compress_array_indices(indices: list[int]) -> str:
+    """Compress a sorted list of array indices into a SLURM ``--array`` spec.
+
+    SLURM accepts both individual indices and ``a-b`` ranges, comma-separated:
+    ``--array=0-2,5,7-10``. Compressing contiguous runs keeps the scheduler
+    spec compact and avoids hitting argv length limits on large sweeps.
+
+    >>> compress_array_indices([0, 1, 2, 5, 7, 8, 9])
+    '0-2,5,7-9'
+    >>> compress_array_indices([3])
+    '3'
+    >>> compress_array_indices([])
+    ''
+    """
+    if not indices:
+        return ""
+    sorted_indices = sorted(set(indices))
+    runs: list[tuple[int, int]] = []
+    start = prev = sorted_indices[0]
+    for idx in sorted_indices[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        runs.append((start, prev))
+        start = prev = idx
+    runs.append((start, prev))
+    return ",".join(f"{a}" if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def query_running_array_tasks(array_job_id: str | None) -> set[int]:
+    """Return the array task indices still pending or running in SLURM.
+
+    Phase 8 resume: when the prior controller's ``sbatch`` is still
+    scheduling/running tasks, those tasks must NOT be re-submitted into a
+    fresh array job. We query ``squeue`` once at resume time to learn which
+    indices the cluster still owns and skip them.
+
+    Empty array job ID, ``squeue`` failure, or a missing binary all return
+    an empty set — the caller falls back to status-only filtering, which
+    still treats ``submitted`` tasks as owned by the prior array job to avoid
+    duplicate cluster submissions when queue visibility is unavailable.
+    Surfacing the squeue error inline would be noisier without making the
+    answer better.
+    """
+    if not array_job_id:
+        return set()
+    try:
+        result = subprocess.run(
+            ["squeue", "-j", array_job_id, "-h", "-t", "pending,running", "-o", "%a"],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, FileNotFoundError):
+        return set()
+    if result.returncode != 0:
+        return set()
+    indices: set[int] = set()
+    for line in (result.stdout or "").splitlines():
+        token = line.strip()
+        if not token:
+            continue
+        # %a is usually a single int per row, but SLURM can show ranges
+        # (e.g. "3-5") or comma-lists ("3,5,7") for batched array states.
+        for piece in token.split(","):
+            piece = piece.strip()
+            if "-" in piece:
+                start_str, _, end_str = piece.partition("-")
+                try:
+                    start, end = int(start_str), int(end_str)
+                except ValueError:
+                    continue
+                if start <= end:
+                    indices.update(range(start, end + 1))
+            else:
+                try:
+                    indices.add(int(piece))
+                except ValueError:
+                    continue
+    return indices
+
+
+def _read_slurm_block_from_resolved(resolved_path: Path) -> dict:
+    """Pull the [slurm] block out of a resolved trial config.
+
+    Phase 8 array submission shares one resource block across the whole
+    array; we read it from the first trial since static sweeps can't vary
+    slurm.* fields (the validator enforces that).
+    """
+    import tomli
+
+    with open(resolved_path, "rb") as f:
+        resolved = tomli.load(f)
+    return resolved.get("slurm", {}) or {}
+
+
+def _render_array_sbatch(
+    *,
+    study_dir: Path,
+    work_dir: Path,
+    array_spec: str,
+    slurm_block: dict,
+    log_dir: Path,
+) -> str:
+    """Compose the sbatch script content for the array submission.
+
+    Resource directives are pulled from ``slurm_block`` (the [slurm] block
+    of any trial's resolved config). Anything we don't explicitly handle is
+    passed through as-is via ``extra_directives`` so users keep their
+    cluster-specific knobs.
+    """
+    directives: list[str] = [f"#SBATCH --array={array_spec}"]
+    directives.append(f"#SBATCH --output={log_dir.as_posix()}/array-%A_%a.out")
+    directives.append(f"#SBATCH --error={log_dir.as_posix()}/array-%A_%a.err")
+
+    # Common SBATCH directives that map to typical [slurm] config fields.
+    name_to_directive = {
+        "partition": "--partition",
+        "nodes": "--nodes",
+        "ntasks": "--ntasks",
+        "ntasks_per_node": "--ntasks-per-node",
+        "cpus_per_task": "--cpus-per-task",
+        "gpus_per_node": "--gpus-per-node",
+        "gres": "--gres",
+        "mem": "--mem",
+        "time": "--time",
+        "account": "--account",
+        "qos": "--qos",
+        "constraint": "--constraint",
+        "exclusive": "--exclusive",  # boolean
+        "job_name": "--job-name",
+    }
+    for key, flag in name_to_directive.items():
+        if key not in slurm_block:
+            continue
+        value = slurm_block[key]
+        if isinstance(value, bool):
+            if value:
+                directives.append(f"#SBATCH {flag}")
+        else:
+            directives.append(f"#SBATCH {flag}={value}")
+
+    extra = slurm_block.get("extra_directives", []) or []
+    for line in extra:
+        line = str(line).strip()
+        if line.startswith("#SBATCH"):
+            directives.append(line)
+        else:
+            directives.append(f"#SBATCH {line}")
+
+    body = (
+        "set -euo pipefail\n"
+        f'cd "{work_dir.as_posix()}"\n'
+        f'exec uv run sweep-array-task "{study_dir.as_posix()}"\n'
+    )
+    return "#!/bin/bash\n" + "\n".join(directives) + "\n\n" + body
+
+
+def submit_trials_to_slurm_array(
+    artifacts: list[TrialArtifacts],
+    *,
+    study_dir: Path,
+    array_indices: list[int] | None = None,
+) -> tuple[str | None, list[int]]:
+    """Submit one ``sbatch --array`` job covering the given trial indices.
+
+    ``array_indices`` selects which trial indices to include; defaults to
+    every trial in ``artifacts``. Returns ``(array_job_id, submitted_indices)``
+    so the caller can record the SLURM job ID at study level.
+
+    On submission failure, returns ``(None, [])`` and writes ``status="failed"``
+    to every targeted artifact. The aggregate sweep failure handling lives
+    upstream in the controller; this function focuses on the SLURM contract.
+    """
+    if not artifacts:
+        return None, []
+
+    indices = sorted(set(array_indices)) if array_indices is not None else list(range(len(artifacts)))
+    if not indices:
+        return None, []
+
+    selected = [a for i, a in enumerate(artifacts) if i in set(indices)]
+    if not selected:
+        return None, []
+
+    array_spec = compress_array_indices(indices)
+    log_dir = study_dir / "slurm"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    slurm_block = _read_slurm_block_from_resolved(selected[0].resolved_path)
+    sbatch_text = _render_array_sbatch(
+        study_dir=study_dir,
+        work_dir=Path.cwd(),
+        array_spec=array_spec,
+        slurm_block=slurm_block,
+        log_dir=log_dir,
+    )
+    sbatch_path = study_dir / "array.sbatch"
+    sbatch_path.write_text(sbatch_text)
+
+    started = utc_now()
+    for artifact in selected:
+        _write_status(artifact, state="submitting", started_at=started, attempts=1)
+
+    result = subprocess.run(
+        ["sbatch", "--parsable", sbatch_path.as_posix()],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        finished = utc_now()
+        for artifact in selected:
+            _write_status(artifact, state="failed", finished_at=finished, returncode=result.returncode)
+        return None, []
+
+    array_job_id = (result.stdout or "").strip().split(";")[0]
+    if not array_job_id:
+        # sbatch returned 0 but no job id — treat as a malformed submission.
+        finished = utc_now()
+        for artifact in selected:
+            _write_status(artifact, state="failed", finished_at=finished, returncode=-1)
+        return None, []
+
+    submitted_at = utc_now()
+    for artifact in selected:
+        _write_status(
+            artifact,
+            state="submitted",
+            finished_at=submitted_at,
+            slurm_job_id=array_job_id,
+            returncode=0,
+        )
+    return array_job_id, indices
+
+
 def submit_trials_to_slurm(
     artifacts: list[TrialArtifacts],
     continue_on_failure: bool = True,

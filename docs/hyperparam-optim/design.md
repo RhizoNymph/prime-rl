@@ -1142,13 +1142,45 @@ Phase 7e (shipped):
   The trainer + inference stack and any of *their* completed work is
   preserved; new trials proceed normally on the live trainer.
 
-### Phase 8: SLURM Arrays
+### Phase 8: SLURM Arrays (shipped)
 
-Optimize SLURM submission for large static studies:
-
-- Single array job per static grid/random study.
-- Manifest mapping from array task index to trial ID.
-- Skipped for adaptive strategies because future trials are not known up front.
+- ``SlurmSweepSchedulerConfig.use_array: bool = False``. When enabled,
+  the controller submits a single ``sbatch --array=0-N-1`` job covering
+  every trial in a static (grid/random) sweep instead of one ``sbatch``
+  per trial. The validator rejects ``use_array=True`` with adaptive
+  strategies (Optuna, W&B agent) because the array size must be known
+  up front, and rejects sweeps that try to vary ``slurm.*`` parameters
+  because the array shares one resource block.
+- New ``sweep-array-task`` entrypoint at
+  ``prime_rl.entrypoints.sweep_array_task``. Each array task reads
+  ``$SLURM_ARRAY_TASK_ID``, finds the variant in ``manifest.json``
+  whose ``array_task_index`` matches, and execs the trial's recorded
+  command. Status transitions (running → completed/failed) are written
+  per-task to that variant's ``status.json``; the SLURM ``<job>_<task>``
+  identifier is recorded too.
+- ``submit_trials_to_slurm_array`` (``schedulers.py``) writes
+  ``<study>/array.sbatch`` with SBATCH directives pulled from the first
+  trial's resolved ``[slurm]`` block (partition / gpus_per_node / time /
+  cpus_per_task / mem / etc., plus an ``extra_directives`` passthrough),
+  submits via ``sbatch --parsable`` to capture the array job ID, and
+  flips every targeted artifact to ``state="submitted"`` with the SLURM
+  job ID stamped.
+- Manifest: each variant gets ``array_task_index: int | None``; the
+  manifest gets a top-level ``array_job_id`` after submission so
+  ``sacct``/``squeue`` correlation works.
+- Resume: on ``--resume`` the controller queries
+  ``squeue -j <prior_array_job_id> -h -t pending,running -o "%a"`` to
+  detect tasks still alive on the cluster, intersects that with the
+  status-based skip list (``completed`` / ``submitted``), and submits
+  only the remainder via SLURM's compact range syntax
+  (``--array=2,5,7-10``) through ``compress_array_indices``. The
+  manifest's ``write_manifest_with_variants`` preserves
+  ``array_job_id`` across the resume's re-materialization so the
+  squeue lookup has a job to query. ``query_running_array_tasks``
+  returns an empty set when ``squeue`` fails or the binary is missing
+  — the caller falls back to the conservative (potentially-double-
+  submitting) "resubmit by status" behavior, which over-submits
+  rather than dropping work.
 
 ## Decisions
 

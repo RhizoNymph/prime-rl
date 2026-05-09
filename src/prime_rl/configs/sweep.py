@@ -275,9 +275,16 @@ class SlurmSweepSchedulerConfig(BaseConfig):
     controller-managed in-flight cap will land in a later phase; until then
     there is intentionally no ``max_parallel`` knob to avoid promising
     throttling we do not enforce.
+
+    ``use_array`` (Phase 8) opts into a single ``sbatch --array=0-N-1``
+    submission instead of one ``sbatch`` per trial. Lowers scheduler
+    pressure on the cluster for large static studies. Adaptive strategies
+    (Optuna, W&B agent) reject array mode because future trials aren't
+    known up front.
     """
 
     type: Literal["slurm"] = "slurm"
+    use_array: bool = False
 
 
 # Parameter paths a multi_run_lora sweep is allowed to vary. Must stay in
@@ -444,6 +451,19 @@ class SweepConfig(BaseConfig):
                 "early_stopping is not supported with the SLURM scheduler: the controller submits "
                 "jobs and exits, so it never observes trial completion to decide when to halt."
             )
+        if isinstance(self.scheduler, SlurmSweepSchedulerConfig) and self.scheduler.use_array:
+            if not isinstance(self.strategy, (GridStrategyConfig, RandomStrategyConfig)):
+                raise ValueError(
+                    "SLURM array submission (scheduler.use_array=True) only supports static "
+                    "strategies (grid/random) — adaptive strategies don't know all their trials "
+                    "up front, so the array size cannot be sized."
+                )
+            if any(path.startswith("slurm.") for path in self.parameters):
+                raise ValueError(
+                    "SLURM array submission requires identical resource declarations across all "
+                    "trials (one sbatch script for the whole array), so parameters cannot vary "
+                    "slurm.* fields."
+                )
         if isinstance(self.strategy, OptunaStrategyConfig):
             if self.objective is None:
                 raise ValueError("Optuna strategy requires an objective to optimize.")
