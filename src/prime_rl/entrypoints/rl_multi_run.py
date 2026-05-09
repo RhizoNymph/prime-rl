@@ -101,6 +101,41 @@ def _validate_concurrency(config: RLConfig, run_dirs: list[Path]) -> None:
         )
 
 
+EXIT_CODE_FILENAME = "exit_code"
+
+
+def _write_orchestrator_exit_code(run_dir: Path, returncode: int | None) -> None:
+    """Write a per-orchestrator returncode for the sweep controller to reconcile.
+
+    The sweep controller reads each ``<run_dir>/control/exit_code`` after the
+    multi-run invocation exits, so it can attribute failures to the actual
+    orchestrator that crashed instead of marking every trial in the wave
+    failed (the Phase 7a behavior). ``None`` means "the launcher tore down the
+    orchestrator before it produced an exit code"; we record ``-1`` so the
+    controller treats it as an infrastructure failure.
+    """
+    control_dir = run_dir / "control"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    code = -1 if returncode is None else int(returncode)
+    (control_dir / EXIT_CODE_FILENAME).write_text(f"{code}\n")
+
+
+def _record_orchestrator_exit_codes(
+    orchestrator_processes, run_dirs: list[Path]
+) -> None:
+    """Best-effort: write exit_code for every run dir, swallowing per-run write errors.
+
+    A failure to write one exit_code must not prevent the others from being
+    recorded — the controller falls back to "infrastructure failure" when the
+    file is missing, which is at least diagnosable.
+    """
+    for proc, run_dir in zip(orchestrator_processes, run_dirs):
+        try:
+            _write_orchestrator_exit_code(run_dir, proc.returncode)
+        except OSError:
+            continue
+
+
 def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
     assert config.deployment.type == "single_node", "rl-multi-run is single-node only"
     _validate_concurrency(config, run_dirs)
@@ -138,16 +173,17 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
 
     supervisor = LaunchSupervisor(logger=logger, log_dir=log_dir)
 
+    orchestrator_labels: list[str] = []
+    orchestrator_processes = []
+
     def sigterm_handler(signum, frame):
         logger.warning("Received SIGTERM, terminating all processes...")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
+        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, sigterm_handler)
-
-    orchestrator_labels: list[str] = []
-    orchestrator_processes = []
 
     try:
         if config.inference:
@@ -217,6 +253,11 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         # which they do as their subprocesses exit.
         wait_for_completion(orchestrator_labels + ["trainer"], supervisor)
 
+        # Per-orchestrator exit_code is the sweep controller's source of
+        # truth for failure attribution; write it as soon as we've waited
+        # for every orchestrator, before any cleanup that might mask codes.
+        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+
         failed_orchestrators = [
             (label, proc.returncode)
             for label, proc in zip(orchestrator_labels, orchestrator_processes)
@@ -243,11 +284,13 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         logger.warning("Received interrupt signal, terminating all processes...")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
+        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
+        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         raise
 
 

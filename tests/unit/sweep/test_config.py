@@ -524,18 +524,19 @@ def test_multi_run_lora_rejects_resume(tmp_path: Path) -> None:
         )
 
 
-def test_multi_run_lora_rejects_optuna_strategy(tmp_path: Path) -> None:
-    """Phase 7a: Optuna pruning needs trainer-side eviction, deferred to 7b."""
-    with pytest.raises(ValidationError, match="multi_run_lora"):
-        SweepConfig(
-            base=[tmp_path / "base.toml"],
-            output_dir=tmp_path / "study",
-            scheduler={
-                "type": "multi_run_lora",
-                "max_concurrent_runs": 2,
-                "shared": [tmp_path / "shared.toml"],
-            },
-            strategy={"type": "optuna", "num_trials": 4},
-            parameters={"orchestrator.optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
-            objective={"metric": "reward", "direction": "maximize"},
-        )
+def test_multi_run_lora_accepts_optuna_strategy(tmp_path: Path) -> None:
+    """Phase 7b: Optuna + multi_run_lora is supported via the wave driver."""
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [tmp_path / "shared.toml"],
+        },
+        strategy={"type": "optuna", "num_trials": 4},
+        parameters={"orchestrator.optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+    assert config.strategy.type == "optuna"
+    assert config.scheduler.type == "multi_run_lora"

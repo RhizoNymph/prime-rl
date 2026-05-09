@@ -300,12 +300,12 @@ MULTI_RUN_LORA_PARAMETER_PREFIXES: tuple[str, ...] = (
 class MultiRunLoRASchedulerConfig(BaseConfig):
     """Run all trials concurrently against one shared trainer + inference.
 
-    Phase 7a: launches a single ``rl-multi-run`` invocation that brings up
+    Static sweeps launch a single ``rl-multi-run`` invocation that brings up
     one trainer (with ``trainer.max_concurrent_runs >= num_trials``), one
     inference server, and ``num_trials`` orchestrators — one per trial.
-    Each orchestrator runs its own RL loop against its own LoRA adapter
-    inside the shared trainer. Pruning and resume against a still-running
-    trainer are deferred to Phase 7b.
+    Optuna sweeps run in waves so in-flight trials can be pruned between
+    intermediate metric reports. Resume against a still-running trainer is
+    intentionally deferred to a later phase.
     """
 
     type: Literal["multi_run_lora"] = "multi_run_lora"
@@ -461,12 +461,6 @@ class SweepConfig(BaseConfig):
                     "Resume with the Optuna strategy requires strategy.storage so the study "
                     "can be reloaded; in-memory studies vanish when the controller exits."
                 )
-            if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
-                raise ValueError(
-                    "Optuna strategy is not supported with the multi_run_lora scheduler in "
-                    "Phase 7a. Pruning a single run mid-flight needs trainer-side eviction "
-                    "support that lands in Phase 7b."
-                )
         if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
             if self.entrypoint != "rl":
                 raise ValueError(
@@ -475,9 +469,9 @@ class SweepConfig(BaseConfig):
                 )
             if self.resume:
                 raise ValueError(
-                    "Resume is not supported with the multi_run_lora scheduler in Phase 7a; "
+                    "Resume is not supported with the multi_run_lora scheduler in Phase 7b; "
                     "re-attaching to a still-running shared trainer needs reconciliation work "
-                    "that lands in Phase 7b."
+                    "that lands in Phase 7c."
                 )
             offending = [
                 path

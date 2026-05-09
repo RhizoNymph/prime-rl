@@ -1024,18 +1024,52 @@ Phase 7a (this branch):
   run dir's ``metrics.jsonl`` (Phase 5b's canonical source) to record
   per-trial objectives.
 
-Deferred to Phase 7b:
+Phase 7b (shipped):
 
-- Run-level pruning through ``control/evicted.txt`` (instead of the
-  Phase 5b SIGTERM-based prune path).
-- Retry semantics when one of N orchestrators fails (Phase 7a marks
-  every trial failed when the aggregate ``rl-multi-run`` invocation
-  exits non-zero, since per-orchestrator status reconciliation needs
-  trainer-side coordination).
-- Resume against a still-running shared trainer (rejected at config
-  validation time in 7a).
-- Optuna with ``multi_run_lora`` (mid-flight pruning needs trainer
-  eviction support).
+- **Per-orchestrator failure attribution.** ``rl-multi-run`` writes
+  ``<run_dir>/control/exit_code`` for each orchestrator on exit (success
+  path, SIGTERM path, and ``KeyboardInterrupt`` path). The sweep
+  controller's ``reconcile_multi_run_artifact`` reads each per-run code
+  instead of relying on the aggregate launcher returncode, so a wave with
+  one OOM no longer marks healthy survivors failed. A pre-existing
+  ``state="pruned"`` (set by the controller before writing
+  ``evicted.txt``) is preserved verbatim — the orchestrator's inevitable
+  non-zero exit on eviction does not flip it back to ``failed``.
+- **Mid-flight pruning helper** (``src/prime_rl/sweep/multi_run.py``):
+  ``prune_run(run_dir, reason, *, step, value)`` pre-marks
+  ``status.json`` then writes ``<run_dir>/control/evicted.txt``. Order
+  matters because the orchestrator polls ``evicted.txt`` and exits
+  non-zero — without the pre-mark the launcher's exit-code reconcile
+  would misclassify the deliberate prune as a failure. The trainer's
+  ``MultiRunManager`` picks up the same file on its next discover cycle
+  and frees the LoRA slot.
+- **Optuna + ``multi_run_lora`` wave driver** (``run_multi_run_optuna_sweep``):
+  asks ``min(max_concurrent_runs, remaining)`` trials per wave,
+  materializes each as a ``run_*`` dir, spawns one ``rl-multi-run``
+  via ``Popen``, polls each ``run_dir/metrics.jsonl`` for new
+  ``(step, value)`` pairs, calls ``optuna_trial.report`` and prunes via
+  ``prune_run`` if ``should_prune()`` fires, then ``study.tell``s every
+  trial's result once the wave finishes (PRUNED / value / FAIL based on
+  reconciled state). Reuses ``_create_study``,
+  ``_suggest_parameters``, and ``_make_trial`` from the single-trial
+  Optuna driver so behavior matches.
+
+  *Wave-mode tradeoff:* a slot freed mid-wave by pruning sits idle until
+  the wave finishes — wasted GPU on heavily-pruned waves, but it keeps
+  ``rl-multi-run`` stateless. Cross-wave pruning works through Optuna's
+  pruners as usual (the sampler's history updates at ``tell`` time after
+  each wave), so early pruning can lag one wave for ``MedianPruner`` /
+  ``Hyperband`` to accumulate context.
+
+Deferred to Phase 7c:
+
+- **Resume against a still-running shared trainer.** Validator still
+  rejects ``resume + multi_run_lora``; needs PID/heartbeat tracking of
+  the trainer torchrun and a re-attach path on the launcher side.
+- **Dynamic slot replacement / auto-retry.** Pruned or failed slots stay
+  idle until their wave finishes. True slot replacement requires
+  ``rl-multi-run`` to accept new run dirs over the wire (or to be a
+  long-lived daemon).
 
 ### Phase 8: SLURM Arrays
 

@@ -25,6 +25,7 @@ from prime_rl.sweep.materialize import (
     record_trial_objective,
 )
 from prime_rl.sweep.metrics import read_final_summary
+from prime_rl.sweep.multi_run import run_multi_run_optuna_sweep
 from prime_rl.sweep.optuna_loop import run_optuna_sweep
 from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import (
@@ -212,8 +213,8 @@ def _run_optuna(config: SweepConfig) -> None:
         raise SystemExit(1)
 
 
-def _run_multi_run(config: SweepConfig) -> None:
-    """Drive a shared-trainer LoRA sweep through ``rl-multi-run``."""
+def _run_multi_run_static(config: SweepConfig) -> None:
+    """Drive a static (grid/random) shared-trainer LoRA sweep through ``rl-multi-run``."""
     assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
     artifacts = _materialize_multi_run_study(config)
 
@@ -230,7 +231,7 @@ def _run_multi_run(config: SweepConfig) -> None:
         raise SystemExit(
             f"multi_run_lora scheduler.max_concurrent_runs={config.scheduler.max_concurrent_runs} "
             f"but the search expanded to {len(artifacts)} trials. Increase max_concurrent_runs "
-            "or shrink the search space; chunked execution lands in Phase 7b."
+            "or shrink the search space; wave-based execution requires Optuna (Phase 7b)."
         )
 
     failures = submit_trials_to_multi_run_lora(
@@ -243,7 +244,15 @@ def _run_multi_run(config: SweepConfig) -> None:
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
     if config.objective is not None and tracker is not None:
         for artifact in artifacts:
-            objective = read_final_summary(artifact.run_dir, config.objective.metric)
+            # reconcile_multi_run_artifact already chose between completed /
+            # failed / pruned; only completed trials have an objective worth
+            # rereading from metrics.jsonl, but record_trial_objective(None)
+            # for the others keeps status.json's shape consistent.
+            status = json.loads(artifact.status_path.read_text())
+            if status.get("state") == "completed":
+                objective = read_final_summary(artifact.run_dir, config.objective.metric)
+            else:
+                objective = None
             record_trial_objective(artifact.status_path, objective)
             tracker.observe(
                 TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
@@ -259,13 +268,62 @@ def _run_multi_run(config: SweepConfig) -> None:
         raise SystemExit(1)
 
 
-def run_sweep(config: SweepConfig) -> None:
-    if isinstance(config.strategy, OptunaStrategyConfig):
-        _run_optuna(config)
+def _run_multi_run_optuna(config: SweepConfig) -> None:
+    """Drive an Optuna study against ``rl-multi-run`` in waves of size ``max_concurrent_runs``."""
+    assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
+    assert isinstance(config.strategy, OptunaStrategyConfig)
+    if config.output_dir.exists() and config.clean_output_dir:
+        shutil.rmtree(config.output_dir)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    multi_run_shared_dir(config).mkdir(parents=True, exist_ok=True)
+    _write_toml(config.output_dir / "study.toml", config.model_dump(exclude_none=True, mode="json"))
+
+    if config.dry_run:
+        print(
+            "Dry run for Optuna + multi_run_lora is a no-op: trials are proposed wave by wave "
+            "based on prior objectives, so they cannot be materialized up front."
+        )
         return
 
+    failures, tracker, artifacts = run_multi_run_optuna_sweep(
+        config,
+        write_manifest_with_variants=write_manifest_with_variants,
+        build_variant=build_variant,
+    )
+
+    if tracker is not None:
+        summary = asdict(tracker.summary())
+        _update_manifest_summary(config, summary)
+        if summary["best_trial_id"] is not None:
+            label = tracker.best_label or summary["best_trial_id"]
+            print(f"Best trial: {label} ({summary['best_value']})")
+        if summary["halted_by_early_stopping"]:
+            print(f"Sweep halted by early stopping ({summary['halt_reason']}).")
+
+    if failures > 0:
+        print(f"Sweep finished with {failures} failed trial(s) out of {len(artifacts)}.")
+        raise SystemExit(1)
+
+
+def _run_multi_run(config: SweepConfig) -> None:
+    """Dispatch a shared-trainer LoRA sweep based on the search strategy."""
+    assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
+    if isinstance(config.strategy, OptunaStrategyConfig):
+        _run_multi_run_optuna(config)
+        return
+    _run_multi_run_static(config)
+
+
+def run_sweep(config: SweepConfig) -> None:
+    # multi_run_lora dispatches first because the Optuna + multi_run_lora
+    # combination has its own wave driver — falling through to _run_optuna
+    # would launch single-trial mode against the wrong scheduler.
     if isinstance(config.scheduler, MultiRunLoRASchedulerConfig):
         _run_multi_run(config)
+        return
+
+    if isinstance(config.strategy, OptunaStrategyConfig):
+        _run_optuna(config)
         return
 
     artifacts = _materialize_study(config)
