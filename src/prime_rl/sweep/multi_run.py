@@ -26,10 +26,12 @@ from prime_rl.configs.sweep import (
 )
 from prime_rl.sweep.early_stopping import TrialOutcome, TrialOutcomeTracker
 from prime_rl.sweep.materialize import (
-    Trial,
     TrialArtifacts,
     materialize_multi_run_trial,
     multi_run_shared_dir,
+    read_status_json,
+    record_multi_run_materialization_failure,
+    record_trial_missing_objective,
     record_trial_objective,
 )
 from prime_rl.sweep.metrics import read_final_summary, read_intermediate_metric
@@ -40,7 +42,11 @@ from prime_rl.sweep.optuna_loop import (
     _suggest_parameters,
 )
 from prime_rl.sweep.schedulers import (
+    _mark_inactive_multi_run_dirs_evicted,
+    _read_orchestrator_exit_code,
     _read_status,
+    _reset_multi_run_artifact_runtime,
+    _write_launch_failure_status,
     _write_status,
     build_multi_run_command,
     reconcile_multi_run_artifact,
@@ -74,7 +80,7 @@ def prune_run(
     context (manual prune, future heuristics) can still mark the trial pruned.
     """
     status_path = run_dir / "status.json"
-    status = json.loads(status_path.read_text())
+    status = read_status_json(status_path)
     status["state"] = "pruned"
     status["pruned_reason"] = reason
     if step is not None:
@@ -104,7 +110,8 @@ def _poll_wave_for_pruning(
 
     On each tick:
 
-    1. For every artifact whose status is not already ``pruned``, read the
+    1. For every artifact whose status is not already ``pruned`` and whose
+       orchestrator has not already recorded ``control/exit_code``, read the
        latest ``(step, value)`` from its ``metrics.jsonl`` sidecar.
     2. If we've never reported this step (or any step at all) for this trial,
        call ``optuna_trial.report(value, step)`` and check ``should_prune``.
@@ -126,6 +133,8 @@ def _poll_wave_for_pruning(
                 continue
             if status.get("state") == "pruned":
                 continue
+            if _read_orchestrator_exit_code(artifact) is not None:
+                continue
 
             sample = read_intermediate_metric(artifact.run_dir, metric)
             if sample is None:
@@ -138,7 +147,17 @@ def _poll_wave_for_pruning(
             optuna_trial.report(value, step)
             last_step[artifact.run_dir] = step
 
+            if _read_orchestrator_exit_code(artifact) is not None:
+                continue
+            if proc.poll() is not None:
+                break
             if optuna_trial.should_prune():
+                # The wave may finish between the loop guard and this
+                # decision. Once rl-multi-run has exited, final objective
+                # reconciliation wins and pruning must not rewrite a
+                # completed run as pruned.
+                if proc.poll() is not None:
+                    break
                 prune_run(
                     artifact.run_dir,
                     reason=f"optuna prune at step {step}",
@@ -180,6 +199,7 @@ def _tell_wave_results(
                 # Clean exit but the metric never showed up — Optuna learned
                 # nothing from this slot. Tell FAIL and count it as a sweep
                 # failure (mirrors the single-trial Optuna driver).
+                record_trial_missing_objective(artifact.status_path, metric)
                 study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
                 failures += 1
             else:
@@ -239,12 +259,14 @@ def run_multi_run_optuna_sweep(
         if tracker.halted:
             break
         this_wave = min(wave_size, total - submitted)
+        stop_after_wave = False
 
         # 1. Ask Optuna for `this_wave` trials and materialize each.
-        # Failed materializations are dropped from the wave (and reported as
-        # Optuna FAIL); survivors stay paired so the poll loop and reconcile
-        # step have aligned (optuna_trial, artifact) lists.
+        # Failed materializations are excluded from the launch wave but kept
+        # in the manifest; survivors stay paired so the poll loop and
+        # reconcile step have aligned (optuna_trial, artifact) lists.
         wave_pairs: list[tuple[optuna.Trial, TrialArtifacts]] = []
+        wave_artifacts_for_manifest: list[TrialArtifacts] = []
         for offset in range(this_wave):
             optuna_trial = study.ask()
             params = _suggest_parameters(optuna_trial, config.parameters)
@@ -252,32 +274,103 @@ def run_multi_run_optuna_sweep(
             try:
                 artifact = materialize_multi_run_trial(config, sweep_trial, scheduler)
             except Exception as exc:
+                artifact = record_multi_run_materialization_failure(
+                    config, sweep_trial, scheduler, exc, finished_at=utc_now()
+                )
+                wave_artifacts_for_manifest.append(artifact)
                 study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
                 failures += 1
-                if not config.continue_on_failure:
-                    raise SystemExit(1) from exc
                 print(f"Optuna trial {sweep_trial.id} failed materialization: {exc}")
+                if not config.continue_on_failure:
+                    stop_after_wave = True
+                    break
                 continue
             wave_pairs.append((optuna_trial, artifact))
+            wave_artifacts_for_manifest.append(artifact)
+
+        if stop_after_wave:
+            if wave_pairs:
+                finished_at = utc_now()
+                for optuna_trial, artifact in wave_pairs:
+                    _write_status(
+                        artifact,
+                        state="failed",
+                        finished_at=finished_at,
+                        returncode=-1,
+                        objective=None,
+                        failure_stage="scheduler",
+                        error=(
+                            "Trial was not launched because another trial in the same Optuna "
+                            "multi_run_lora wave failed materialization and continue_on_failure=false."
+                        ),
+                    )
+                    study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                    failures += 1
+            if wave_artifacts_for_manifest:
+                all_artifacts.extend(wave_artifacts_for_manifest)
+                write_manifest_with_variants(config, [build_variant(a) for a in all_artifacts])
+            break
 
         # If every trial in the wave failed materialization there's nothing
         # to launch; advance the counter and try the next wave.
         if not wave_pairs:
+            if wave_artifacts_for_manifest:
+                all_artifacts.extend(wave_artifacts_for_manifest)
+                write_manifest_with_variants(config, [build_variant(a) for a in all_artifacts])
             submitted += this_wave
             continue
 
         wave_optuna_trials = [pair[0] for pair in wave_pairs]
         wave_artifacts = [pair[1] for pair in wave_pairs]
-        all_artifacts.extend(wave_artifacts)
+        all_artifacts.extend(wave_artifacts_for_manifest)
         write_manifest_with_variants(config, [build_variant(a) for a in all_artifacts])
-
-        started = utc_now()
-        for artifact in wave_artifacts:
-            _write_status(artifact, state="running", started_at=started, attempts=1, gpu_group=None)
 
         # 2. Spawn rl-multi-run for this wave.
         command = build_multi_run_command(wave_artifacts, scheduler.shared, shared_dir)
-        proc = subprocess.Popen(command)
+        proc = None
+        attempts = 0
+        while proc is None:
+            attempts += 1
+            started = utc_now()
+            for artifact in wave_artifacts:
+                _reset_multi_run_artifact_runtime(artifact)
+                _write_status(artifact, state="running", started_at=started, attempts=attempts, gpu_group=None)
+            _mark_inactive_multi_run_dirs_evicted(
+                shared_dir,
+                [artifact.run_dir for artifact in wave_artifacts],
+                reason="Inactive run directory is not part of the current Optuna wave.",
+            )
+            try:
+                proc = subprocess.Popen(command)
+            except OSError as exc:
+                if attempts <= config.retry_budget:
+                    continue
+                finished_at = utc_now()
+                wave_failures = 0
+                for optuna_trial, artifact in zip(wave_optuna_trials, wave_artifacts):
+                    _write_launch_failure_status(artifact, exc, finished_at=finished_at)
+                    study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                    wave_failures += 1
+                failures += wave_failures
+
+                for artifact in wave_artifacts:
+                    tracker.observe(
+                        TrialOutcome(
+                            trial_id=artifact.trial.id,
+                            label=artifact.trial.label,
+                            objective=None,
+                        )
+                    )
+
+                submitted += this_wave
+                if not config.continue_on_failure:
+                    stop_after_wave = True
+                break
+
+        if proc is None:
+            if stop_after_wave:
+                break
+            continue
 
         try:
             _poll_wave_for_pruning(
@@ -293,7 +386,7 @@ def run_multi_run_optuna_sweep(
         failures += wave_failures
 
         if wave_failures > 0 and not config.continue_on_failure:
-            raise SystemExit(proc.returncode if proc.returncode != 0 else 1)
+            stop_after_wave = True
 
         # 5. Fold objectives into the tracker for early stopping + summary.
         for artifact, objective in zip(wave_artifacts, objectives):
@@ -308,6 +401,8 @@ def run_multi_run_optuna_sweep(
                 break
 
         submitted += this_wave
+        if stop_after_wave:
+            break
 
     write_manifest_with_variants(config, [build_variant(a) for a in all_artifacts])
     return failures, tracker, all_artifacts

@@ -17,6 +17,7 @@ from prime_rl.configs.sweep import (
     PatienceStoppingConfig,
     ThresholdStoppingConfig,
 )
+from prime_rl.sweep.metrics import coerce_finite_float
 
 
 @dataclass(frozen=True)
@@ -59,20 +60,21 @@ class TrialOutcomeTracker:
         """Record an outcome and return whether the study should halt."""
         with self._lock:
             self._outcomes.append(outcome)
-            if outcome.objective is None:
+            value = coerce_finite_float(outcome.objective)
+            if value is None:
                 # Missing metrics do not advance early-stopping decisions.
                 return self._halted
 
             self._completed += 1
-            if self._is_improvement(outcome.objective):
-                self._best_value = outcome.objective
+            if self._is_improvement(value):
+                self._best_value = value
                 self._best_trial_id = outcome.trial_id
                 self._best_label = outcome.label
                 self._steps_without_improvement = 0
             else:
                 self._steps_without_improvement += 1
 
-            if not self._halted and self._should_halt(outcome.objective):
+            if not self._halted and self._should_halt(value):
                 self._halted = True
 
             return self._halted

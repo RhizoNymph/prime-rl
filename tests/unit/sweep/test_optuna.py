@@ -9,12 +9,26 @@ pytest.importorskip("optuna")
 
 from prime_rl.configs.sweep import SweepConfig  # noqa: E402
 from prime_rl.sweep.controller import run_sweep  # noqa: E402
+from prime_rl.sweep.reproducibility import file_checksum  # noqa: E402
+from prime_rl.sweep.search import parameters_hash  # noqa: E402
 
 
 def write_toml(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         tomli_w.dump(data, f)
+
+
+def with_base_checksums(variant: dict, base_path: Path) -> dict:
+    return {
+        **variant,
+        "resolved_checksum": variant.get("resolved_checksum", "0" * 64),
+        "base_checksums": {base_path.as_posix(): file_checksum(base_path)},
+    }
+
+
+def optuna_trial_id(number: int, overrides: dict) -> str:
+    return f"{number:04d}-{parameters_hash(overrides)}"
 
 
 def _install_fake_run(monkeypatch, sequence):
@@ -145,6 +159,826 @@ def test_optuna_resume_runs_only_remaining_budget(tmp_path: Path, monkeypatch) -
     assert final_manifest["summary"]["best_value"] == max(rewards)
 
 
+def test_optuna_resume_rejects_base_config_drift(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 2})
+
+    with pytest.raises(RuntimeError, match="base config checksums"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_objective_drift(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    drifted = {
+        **base_kwargs,
+        "objective": {"metric": "loss", "direction": "minimize"},
+    }
+
+    with pytest.raises(RuntimeError, match="objective changed"):
+        run_sweep(SweepConfig(**drifted, resume=True))
+
+
+def test_optuna_resume_rejects_parameter_drift(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    drifted = {
+        **base_kwargs,
+        "parameters": {"optim.lr": {"distribution": "log_uniform", "min": 1e-5, "max": 1e-3}},
+    }
+
+    with pytest.raises(RuntimeError, match="parameters changed"):
+        run_sweep(SweepConfig(**drifted, resume=True))
+
+
+def test_optuna_resume_rejects_parameter_order_drift(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={
+            "optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4},
+            "optim.warmup": {"distribution": "int_uniform", "min": 0, "max": 10, "step": 2},
+        },
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    reordered = {
+        **base_kwargs,
+        "parameters": {
+            "optim.warmup": {"distribution": "int_uniform", "min": 0, "max": 10, "step": 2},
+            "optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4},
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="parameter order changed"):
+        run_sweep(SweepConfig(**reordered, resume=True))
+
+
+def test_optuna_resume_rejects_strategy_drift(tmp_path: Path, monkeypatch) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+            "study_name": "original-study",
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    drifted = {
+        **base_kwargs,
+        "strategy": {
+            **base_kwargs["strategy"],
+            "study_name": "different-study",
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="strategy changed"):
+        run_sweep(SweepConfig(**drifted, resume=True))
+
+
+def test_optuna_resume_rejects_existing_storage_without_manifest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    (tmp_path / "study" / "manifest.json").unlink()
+
+    with pytest.raises(RuntimeError, match="manifest variant entries"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_without_storage_trials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_path = tmp_path / "optuna.db"
+    storage_url = f"sqlite:///{storage_path}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    storage_path.unlink()
+
+    with pytest.raises(RuntimeError, match="missing from storage"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_variant_without_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    Path(manifest["variants"][0]["status_path"]).unlink()
+
+    with pytest.raises(RuntimeError, match="status.json"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_variant_with_missing_status_path_field(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"][0].pop("status_path")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="status.json"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+@pytest.mark.parametrize("status_text", ["{not-json", "[]"])
+def test_optuna_resume_rejects_malformed_status_json(
+    tmp_path: Path, monkeypatch, status_text: str
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    Path(manifest["variants"][0]["status_path"]).write_text(status_text)
+
+    with pytest.raises(RuntimeError, match="valid JSON objects"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_variant_without_resolved_checksum(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"][0].pop("resolved_checksum")
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="resolved_checksum"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_variant_with_mismatched_status_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    status_path = Path(manifest["variants"][0]["status_path"])
+    status = json.loads(status_path.read_text())
+    status["id"] = "0001-wrong"
+    status_path.write_text(json.dumps(status))
+
+    with pytest.raises(RuntimeError, match="status.json id"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_variant_with_mismatched_id_hash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    variant = manifest["variants"][0]
+    variant["id"] = "0000-deadbeef"
+    status_path = Path(variant["status_path"])
+    status = json.loads(status_path.read_text())
+    status["id"] = variant["id"]
+    status_path.write_text(json.dumps(status))
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="ids and overrides"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_manifest_overrides_mismatching_storage_params(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    variant = manifest["variants"][0]
+    variant["overrides"] = {"optim.lr": variant["overrides"]["optim.lr"] * 10}
+    variant["id"] = optuna_trial_id(0, variant["overrides"])
+    status_path = Path(variant["status_path"])
+    status = json.loads(status_path.read_text())
+    status["id"] = variant["id"]
+    status_path.write_text(json.dumps(status))
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="storage parameters"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_complete_storage_with_failed_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    status_path = Path(manifest["variants"][0]["status_path"])
+    status = json.loads(status_path.read_text())
+    status.update({"state": "failed", "returncode": -1, "objective": None})
+    status_path.write_text(json.dumps(status))
+
+    with pytest.raises(RuntimeError, match="terminal status.json files to match"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+@pytest.mark.parametrize(
+    "status_update",
+    [
+        {"state": "completed", "returncode": 0, "objective": 0.4},
+        {"state": "failed", "returncode": 1, "objective": 0.4},
+    ],
+)
+def test_optuna_resume_rejects_failed_storage_status_mismatch(
+    tmp_path: Path, monkeypatch, status_update: dict
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        overrides = [part for part in command if part.endswith("overrides.toml")]
+        if not overrides:
+            return real_run(command, **kwargs)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as initial_exit:
+        run_sweep(SweepConfig(**base_kwargs))
+    assert initial_exit.value.code == 1
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    status_path = Path(manifest["variants"][0]["status_path"])
+    status = json.loads(status_path.read_text())
+    status.update(status_update)
+    status_path.write_text(json.dumps(status))
+
+    with pytest.raises(RuntimeError, match="terminal status.json files to match"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_rejects_duplicate_manifest_variants(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"].append(dict(manifest["variants"][0]))
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="Duplicate"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+@pytest.mark.parametrize(
+    ("variants", "message"),
+    [
+        (None, "variants to be recorded as a list"),
+        ("", "variants to be recorded as a list"),
+        ({"id": "0000-not-a-list"}, "variants to be recorded as a list"),
+        (["0000-not-an-object"], "variant entry.*JSON object"),
+    ],
+)
+def test_optuna_resume_rejects_malformed_manifest_variants_shape(
+    tmp_path: Path, monkeypatch, variants, message: str
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(SweepConfig(**base_kwargs))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"] = variants
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match=message):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+
+def test_optuna_resume_does_not_reconcile_running_trial_without_manifest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    initial = SweepConfig(**base_kwargs)
+    initial.strategy.num_trials = 1
+    run_sweep(initial)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    pending = study.ask()
+    (tmp_path / "study" / "manifest.json").unlink()
+
+    with pytest.raises(RuntimeError, match="manifest variant entries"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    assert study.trials[pending.number].state == optuna.trial.TrialState.RUNNING
+
+
+def test_optuna_resume_does_not_reconcile_running_trial_with_duplicate_manifest_entries(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    initial = SweepConfig(**base_kwargs)
+    initial.strategy.num_trials = 1
+    run_sweep(initial)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    pending = study.ask()
+    pending_overrides = dict(pending.params)
+    pending_id = optuna_trial_id(pending.number, pending_overrides)
+    trial_dir = tmp_path / "study" / "trials" / pending_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trial_dir / "status.json"
+    status_path.write_text(
+        json.dumps({"id": pending_id, "state": "completed", "returncode": 0, "objective": 0.95})
+    )
+
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    variant = {
+        "id": pending_id,
+        "label": pending_id,
+        "overrides": pending_overrides,
+        "status_path": status_path.as_posix(),
+        "output_dir": (trial_dir / "run").as_posix(),
+    }
+    variant = with_base_checksums(variant, base_path)
+    manifest["variants"].extend([variant, dict(variant)])
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match="Duplicate"):
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    assert study.trials[pending.number].state == optuna.trial.TrialState.RUNNING
+
+
+def test_optuna_resume_counts_previous_failed_trials(tmp_path: Path, monkeypatch, capsys) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        overrides = [part for part in command if part.endswith("overrides.toml")]
+        if not overrides:
+            return real_run(command, **kwargs)
+        run_dir = Path(overrides[0]).parent / "run"
+        summary_dir = run_dir / "run-fake"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        (summary_dir / "final_summary.json").write_text(json.dumps({"other": 0.4}))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as initial_exit:
+        run_sweep(SweepConfig(**base_kwargs))
+    assert initial_exit.value.code == 1
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as resume_exit:
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+    assert resume_exit.value.code == 1
+    assert "Sweep finished with 1 failed trial(s) out of 1." in capsys.readouterr().out
+
+
 def test_optuna_marks_failed_materialization_in_storage(tmp_path: Path, monkeypatch) -> None:
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
@@ -165,26 +999,25 @@ def test_optuna_marks_failed_materialization_in_storage(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(loop, "materialize_trial", flaky_materialize)
 
-    config = SweepConfig(
-        entrypoint="sft",
-        base=[base_path],
-        output_dir=tmp_path / "study",
-        strategy={
+    base_kwargs = {
+        "entrypoint": "sft",
+        "base": [base_path],
+        "output_dir": tmp_path / "study",
+        "strategy": {
             "type": "optuna",
             "num_trials": 3,
             "sampler": "random",
             "seed": 7,
             "storage": storage_url,
         },
-        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
-        objective={"metric": "reward", "direction": "maximize"},
-        wandb=None,
-    )
+        "parameters": {"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        "objective": {"metric": "reward", "direction": "maximize"},
+        "wandb": None,
+    }
 
-    try:
-        run_sweep(config)
-    except SystemExit as exc:
-        assert exc.code == 1
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(SweepConfig(**base_kwargs))
+    assert exc_info.value.code == 1
 
     import optuna
 
@@ -192,6 +1025,19 @@ def test_optuna_marks_failed_materialization_in_storage(tmp_path: Path, monkeypa
     states = [t.state for t in study.trials]
     assert optuna.trial.TrialState.FAIL in states
     assert not any(state == optuna.trial.TrialState.RUNNING for state in states)
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert len(manifest["variants"]) == 3
+    failed_variant = next(variant for variant in manifest["variants"] if variant["id"].startswith("0001-"))
+    failed_status = json.loads(Path(failed_variant["status_path"]).read_text())
+    assert failed_status["state"] == "failed"
+    assert failed_status["returncode"] == -1
+    assert failed_status["failure_stage"] == "materialization"
+    assert "fake config validation failure" in failed_status["error"]
+
+    with pytest.raises(SystemExit) as resume_exit:
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+    assert resume_exit.value.code == 1
 
 
 def test_optuna_resume_reconciles_running_trial_with_recorded_objective(
@@ -235,21 +1081,28 @@ def test_optuna_resume_reconciles_running_trial_with_recorded_objective(
     # leave it RUNNING, and have its sweep status.json record an objective.
     pending = study.ask()
     pending_index = pending.number
-    pending_id = f"{pending_index:04d}-fake"
+    pending_overrides = dict(pending.params)
+    pending_id = optuna_trial_id(pending_index, pending_overrides)
     trial_dir = tmp_path / "study" / "trials" / pending_id
     trial_dir.mkdir(parents=True, exist_ok=True)
     status_path = trial_dir / "status.json"
-    status_path.write_text(json.dumps({"state": "completed", "returncode": 0, "objective": 0.95}))
+    status_path.write_text(
+        json.dumps({"id": pending_id, "state": "completed", "returncode": 0, "objective": 0.95})
+    )
 
     manifest_path = tmp_path / "study" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["variants"].append(
-        {
-            "id": pending_id,
-            "label": pending_id,
-            "status_path": status_path.as_posix(),
-            "output_dir": (trial_dir / "run").as_posix(),
-        }
+        with_base_checksums(
+            {
+                "id": pending_id,
+                "label": pending_id,
+                "overrides": pending_overrides,
+                "status_path": status_path.as_posix(),
+                "output_dir": (trial_dir / "run").as_posix(),
+            },
+            base_path,
+        )
     )
     manifest_path.write_text(json.dumps(manifest))
 
@@ -297,9 +1150,35 @@ def test_optuna_resume_reconciles_running_trial_with_no_recorded_objective(
     import optuna
 
     study = optuna.load_study(study_name="sweep", storage=storage_url)
-    study.ask()  # leak a RUNNING trial
+    pending = study.ask()  # leak a RUNNING trial
+    pending_overrides = dict(pending.params)
+    pending_id = optuna_trial_id(pending.number, pending_overrides)
+    trial_dir = tmp_path / "study" / "trials" / pending_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trial_dir / "status.json"
+    status_path.write_text(
+        json.dumps({"id": pending_id, "state": "running", "returncode": None, "objective": None})
+    )
 
-    run_sweep(SweepConfig(**base_kwargs, resume=True))
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"].append(
+        with_base_checksums(
+            {
+                "id": pending_id,
+                "label": pending_id,
+                "overrides": pending_overrides,
+                "status_path": status_path.as_posix(),
+                "output_dir": (trial_dir / "run").as_posix(),
+            },
+            base_path,
+        )
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+    assert exc_info.value.code == 1
 
     study = optuna.load_study(study_name="sweep", storage=storage_url)
     states = [t.state for t in study.trials]
@@ -308,6 +1187,91 @@ def test_optuna_resume_reconciles_running_trial_with_no_recorded_objective(
     assert optuna.trial.TrialState.RUNNING not in states
     assert optuna.trial.TrialState.FAIL in states
     assert sum(1 for s in states if s == optuna.trial.TrialState.COMPLETE) == 1
+
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["returncode"] == -1
+    assert status["objective"] is None
+
+
+def test_optuna_resume_reconciles_running_trial_with_non_finite_objective_as_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Old status files may contain NaN from before finite objective guards.
+
+    Resume should not pass that value to Optuna as a completed result; it is
+    equivalent to a missing objective and must be attributed as a failed
+    orphan.
+    """
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    storage_url = f"sqlite:///{tmp_path / 'optuna.db'}"
+    _install_fake_run(monkeypatch, [0.4, 0.5])
+
+    base_kwargs = dict(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "storage": storage_url,
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    initial = SweepConfig(**base_kwargs)
+    initial.strategy.num_trials = 1
+    run_sweep(initial)
+
+    import optuna
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    pending = study.ask()
+    pending_overrides = dict(pending.params)
+    pending_id = optuna_trial_id(pending.number, pending_overrides)
+    trial_dir = tmp_path / "study" / "trials" / pending_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    status_path = trial_dir / "status.json"
+    status_path.write_text(
+        json.dumps({"id": pending_id, "state": "completed", "returncode": 0, "objective": float("nan")})
+    )
+
+    manifest_path = tmp_path / "study" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["variants"].append(
+        with_base_checksums(
+            {
+                "id": pending_id,
+                "label": pending_id,
+                "overrides": pending_overrides,
+                "status_path": status_path.as_posix(),
+                "output_dir": (trial_dir / "run").as_posix(),
+            },
+            base_path,
+        )
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(SweepConfig(**base_kwargs, resume=True))
+    assert exc_info.value.code == 1
+
+    study = optuna.load_study(study_name="sweep", storage=storage_url)
+    states = [t.state for t in study.trials]
+    assert optuna.trial.TrialState.RUNNING not in states
+    assert optuna.trial.TrialState.FAIL in states
+
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["returncode"] == 0
+    assert status["failure_stage"] == "objective"
+    assert status["objective"] is None
 
 
 def test_optuna_resume_reconciles_pruned_trial_as_pruned_state(
@@ -352,15 +1316,20 @@ def test_optuna_resume_reconciles_pruned_trial_as_pruned_state(
     # never got to tell Optuna.
     pending = study.ask()
     pending_index = pending.number
-    pending_id = f"{pending_index:04d}-pruned"
+    pending_overrides = dict(pending.params)
+    pending_id = optuna_trial_id(pending_index, pending_overrides)
     trial_dir = tmp_path / "study" / "trials" / pending_id
     trial_dir.mkdir(parents=True, exist_ok=True)
     status_path = trial_dir / "status.json"
     status_path.write_text(
         json.dumps(
             {
+                "id": pending_id,
                 "state": "pruned",
-                "objective": None,
+                # Older/corrupt artifacts may carry a stale objective even
+                # though pruned trials must not; resume should normalize it
+                # while telling Optuna TrialState.PRUNED.
+                "objective": 0.01,
                 "pruned_at_step": 5,
                 "pruned_value": 0.01,
             }
@@ -370,12 +1339,16 @@ def test_optuna_resume_reconciles_pruned_trial_as_pruned_state(
     manifest_path = tmp_path / "study" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["variants"].append(
-        {
-            "id": pending_id,
-            "label": pending_id,
-            "status_path": status_path.as_posix(),
-            "output_dir": (trial_dir / "run").as_posix(),
-        }
+        with_base_checksums(
+            {
+                "id": pending_id,
+                "label": pending_id,
+                "overrides": pending_overrides,
+                "status_path": status_path.as_posix(),
+                "output_dir": (trial_dir / "run").as_posix(),
+            },
+            base_path,
+        )
     )
     manifest_path.write_text(json.dumps(manifest))
 
@@ -388,6 +1361,9 @@ def test_optuna_resume_reconciles_pruned_trial_as_pruned_state(
     # FAIL, so the sampler's history correctly reflects deliberate stops.
     assert optuna.trial.TrialState.PRUNED in states
     assert optuna.trial.TrialState.FAIL not in states
+    status = json.loads(status_path.read_text())
+    assert status["state"] == "pruned"
+    assert status["objective"] is None
 
 
 def test_optuna_sweep_halts_on_threshold(tmp_path: Path, monkeypatch) -> None:
@@ -547,6 +1523,8 @@ def test_run_trial_with_pruning_returns_pruned_when_should_prune_fires(tmp_path:
     assert terminated == [True]
     status = json.loads(artifact.status_path.read_text())
     assert status["state"] == "pruned"
+    assert status["returncode"] == -15
+    assert "finished_at" in status
     assert status["pruned_at_step"] == 1
     assert status["pruned_value"] == 0.05
     assert status["objective"] is None
@@ -664,6 +1642,70 @@ def test_run_trial_with_pruning_does_not_prune_after_subprocess_exit(tmp_path: P
     assert status["state"] == "completed"
 
 
+def test_run_trial_with_pruning_does_not_prune_after_timeout_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The process can exit after wait(timeout) times out but before the
+    pruning decision. Re-check poll() so a valid final objective wins."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-timeout-race", label="timeout-race", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    rows = [{"step": 1, "reward": 0.05}]
+
+    class _FakePopenExitsOnPoll(_FakePopen):
+        def poll(self) -> int | None:
+            if self._waits >= 1 and self._returncode is None:
+                self._returncode = self._returncode_value
+            return self._returncode
+
+    def popen_factory(*args, **kwargs):
+        return _FakePopenExitsOnPoll(*args, rows=rows, returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    terminated: list[bool] = []
+    _patch_terminate(monkeypatch, terminated)
+
+    should_prune_calls = 0
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            nonlocal should_prune_calls
+            should_prune_calls += 1
+            return True
+
+    outcome = _run_trial_with_pruning(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.05
+    assert should_prune_calls == 0
+    assert terminated == []
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
+
+
 def test_optuna_no_pruner_counts_clean_exit_without_objective_as_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -698,6 +1740,11 @@ def test_optuna_no_pruner_counts_clean_exit_without_objective_as_failure(
     # No completed trials with a usable objective.
     assert summary["completed"] == 0
     assert summary["best_value"] is None
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "failed"
+        assert status["failure_stage"] == "objective"
 
 
 def test_optuna_no_pruner_halts_when_objective_missing_and_no_continue(
@@ -748,15 +1795,65 @@ def test_optuna_no_pruner_halts_when_objective_missing_and_no_continue(
     assert spawned["n"] == 1
 
 
+def test_optuna_no_pruner_writes_summary_before_halting_on_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    spawned = {"n": 0}
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        overrides = [part for part in command if part.endswith("overrides.toml")]
+        if not overrides:
+            return real_run(command, **kwargs)
+        spawned["n"] += 1
+        if spawned["n"] == 1:
+            run_dir = Path(overrides[0]).parent / "run"
+            summary_dir = run_dir / "run-fake"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            (summary_dir / "final_summary.json").write_text(json.dumps({"reward": 0.9}))
+            return SimpleNamespace(returncode=0)
+        if spawned["n"] == 2:
+            return SimpleNamespace(returncode=2)
+        raise AssertionError("continue_on_failure=false should stop before launching later Optuna trials")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        strategy={"type": "optuna", "num_trials": 5, "sampler": "random", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        retry_budget=0,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert spawned["n"] == 2
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 1
+    assert manifest["summary"]["best_value"] == 0.9
+    states = [json.loads(Path(variant["status_path"]).read_text())["state"] for variant in manifest["variants"]]
+    assert states == ["completed", "failed"]
+
+
 def test_optuna_pruner_completed_without_objective_counts_as_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Regression for the pruner-enabled branch: a trial that exits cleanly
-    but never logged the metric (so objective is None even though state ==
-    'completed') must count toward the sweep failure tally."""
-    from prime_rl.sweep.materialize import Trial, materialize_trial
-    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning
-
+    but never logged the metric must count toward the sweep failure tally."""
     base_path = tmp_path / "base.toml"
     write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
 
@@ -788,6 +1885,12 @@ def test_optuna_pruner_completed_without_objective_counts_as_failure(
     with pytest.raises(SystemExit) as exc_info:
         run_sweep(config)
     assert exc_info.value.code == 1
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "failed"
+        assert status["failure_stage"] == "objective"
 
 
 def test_run_trial_with_pruning_skips_retry_after_intermediate_reports(tmp_path: Path, monkeypatch) -> None:
@@ -848,6 +1951,168 @@ def test_run_trial_with_pruning_skips_retry_after_intermediate_reports(tmp_path:
     assert reports == [(1, 0.05)]
 
 
+def test_run_trial_with_pruning_records_retry_attempt_count(tmp_path: Path, monkeypatch) -> None:
+    """A pruner-enabled trial that fails before reporting can retry; the
+    final status should keep the cumulative attempt count."""
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning_and_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-retry-prune", label="retry", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    spawned = {"n": 0}
+
+    def popen_factory(*args, **kwargs):
+        spawned["n"] += 1
+        if spawned["n"] == 1:
+            return _FakePopen(*args, rows=[], returncode=1, **kwargs)
+        return _FakePopen(*args, rows=[{"step": 1, "reward": 0.9}], returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+    _patch_terminate(monkeypatch, [])
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_and_retries(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+        retry_budget=1,
+    )
+
+    assert outcome.state == "completed"
+    assert spawned["n"] == 2
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["attempts"] == 2
+
+
+def test_run_trial_with_pruning_retries_launch_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning_and_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-launch-error", label="launch-error", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    spawned = {"n": 0}
+
+    def popen_factory(*args, **kwargs):
+        spawned["n"] += 1
+        if spawned["n"] == 1:
+            raise FileNotFoundError("temporary trial launcher miss")
+        return _FakePopen(*args, rows=[{"step": 1, "reward": 0.9}], returncode=0, **kwargs)
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_and_retries(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+        retry_budget=1,
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.returncode == 0
+    assert outcome.launch_error is False
+    assert spawned["n"] == 2
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
+    assert status["attempts"] == 2
+    assert "failure_stage" not in status
+
+
+def test_run_trial_with_pruning_marks_launch_oserror_failed_after_retry_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.optuna_loop import _run_trial_with_pruning_and_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-launch-error", label="launch-error", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    spawned = {"n": 0}
+
+    def popen_factory(*args, **kwargs):
+        spawned["n"] += 1
+        raise FileNotFoundError("missing trial launcher")
+
+    _patch_popen_for_trials(monkeypatch, popen_factory)
+
+    class FakeOptunaTrial:
+        def report(self, value, step):
+            raise AssertionError("launch failures should not report metrics")
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_and_retries(
+        artifact,
+        gpu_group=None,
+        optuna_trial=FakeOptunaTrial(),
+        metric="reward",
+        poll_interval=0.01,
+        retry_budget=1,
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.returncode == -1
+    assert outcome.launch_error is True
+    assert spawned["n"] == 2
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["returncode"] == -1
+    assert status["failure_stage"] == "launch"
+
+
 def test_run_with_retries_truncates_metrics_jsonl_between_attempts(tmp_path: Path, monkeypatch) -> None:
     """Regression: if attempt 1 fails after writing higher steps than the
     successful retry, the sidecar must be truncated between attempts so
@@ -896,6 +2161,40 @@ def test_run_with_retries_truncates_metrics_jsonl_between_attempts(tmp_path: Pat
     # Truncation between attempts must wipe the failed run's row before the
     # successful retry writes its own line.
     assert read_final_summary(artifact.run_dir, "reward") == 0.9
+
+
+def test_run_with_retries_removes_stale_legacy_summary(tmp_path: Path, monkeypatch) -> None:
+    from prime_rl.sweep.materialize import Trial, materialize_trial
+    from prime_rl.sweep.metrics import read_final_summary
+    from prime_rl.sweep.schedulers import _run_with_retries
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        parameters={"optim.lr": {"values": [1e-5]}},
+        wandb=None,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    trial = Trial(id="0000-stale-summary", label="stale", parameters={"optim.lr": 1e-5})
+    artifact = materialize_trial(config, trial)
+
+    stale_summary = artifact.run_dir / "run-old" / "final_summary.json"
+    stale_summary.parent.mkdir(parents=True, exist_ok=True)
+    stale_summary.write_text(json.dumps({"reward": 0.99}))
+
+    def fake_run(command, env=None, **kwargs):
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    returncode = _run_with_retries(artifact, gpu_group=None, retry_budget=0)
+
+    assert returncode == 0
+    assert not stale_summary.exists()
+    assert read_final_summary(artifact.run_dir, "reward") is None
 
 
 def test_optuna_sweep_with_median_pruner_runs_to_completion(tmp_path: Path, monkeypatch) -> None:

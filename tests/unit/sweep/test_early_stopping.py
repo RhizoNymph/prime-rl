@@ -95,3 +95,18 @@ def test_tracker_ignores_missing_objective() -> None:
     assert summary.completed == 1
     assert summary.best_value == 0.5
     assert summary.halted_by_early_stopping is False
+
+
+def test_tracker_ignores_non_finite_objectives() -> None:
+    tracker = TrialOutcomeTracker(
+        ObjectiveConfig(metric="reward", direction="maximize"),
+        PatienceStoppingConfig(patience=1, min_trials=1),
+    )
+    tracker.observe(make_outcome(0, 0.5))
+    tracker.observe(make_outcome(1, float("nan")))
+    tracker.observe(make_outcome(2, float("inf")))
+
+    summary = tracker.summary()
+    assert summary.completed == 1
+    assert summary.best_value == 0.5
+    assert summary.halted_by_early_stopping is False

@@ -1,4 +1,3 @@
-import json
 import os
 import queue
 import subprocess
@@ -8,7 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from prime_rl.sweep.materialize import TrialArtifacts, write_json, write_multi_run_output_override
+from prime_rl.sweep.materialize import (
+    TrialArtifacts,
+    read_status_json,
+    write_json,
+    write_multi_run_output_override,
+)
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 
 TrialCompleteCallback = Callable[[TrialArtifacts, int], bool]
@@ -19,13 +23,35 @@ def utc_now() -> str:
 
 
 def _read_status(artifacts: TrialArtifacts) -> dict:
-    return json.loads(artifacts.status_path.read_text())
+    return read_status_json(artifacts.status_path)
 
 
 def _write_status(artifacts: TrialArtifacts, **updates) -> None:
     status = _read_status(artifacts)
     status.update(updates)
     write_json(artifacts.status_path, status)
+
+
+def _launch_error(exc: OSError) -> str:
+    message = str(exc)
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def _write_launch_failure_status(
+    artifact: TrialArtifacts,
+    exc: OSError,
+    *,
+    finished_at: str | None = None,
+) -> None:
+    _write_status(
+        artifact,
+        state="failed",
+        finished_at=finished_at or utc_now(),
+        returncode=-1,
+        objective=None,
+        failure_stage="launch",
+        error=_launch_error(exc),
+    )
 
 
 def _metrics_jsonl_path(artifact: TrialArtifacts) -> str:
@@ -41,10 +67,16 @@ def _reset_metrics_jsonl(artifact: TrialArtifacts) -> None:
     attempt's value instead of the successful retry's value. The pruning
     loop has the same hazard: a stale row from a previous attempt can fire
     should_prune() before the new attempt has reported anything.
+
+    Legacy ``final_summary.json`` fallback files are attempt-scoped too. If
+    the new attempt never writes metrics, stale summaries from an older run
+    must not be mistaken for a fresh objective.
     """
     path = Path(_metrics_jsonl_path(artifact))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
+    for summary_path in artifact.run_dir.glob("run-*/final_summary.json"):
+        summary_path.unlink()
 
 
 def _build_env(artifact: TrialArtifacts, gpu_group: list[int] | None) -> dict[str, str]:
@@ -78,7 +110,13 @@ def _run_with_retries(artifact: TrialArtifacts, gpu_group: list[int] | None, ret
             attempts=attempts,
             gpu_group=list(gpu_group) if gpu_group is not None else None,
         )
-        result = subprocess.run(artifact.command, env=env)
+        try:
+            result = subprocess.run(artifact.command, env=env)
+        except OSError as exc:
+            if attempts > retry_budget:
+                _write_launch_failure_status(artifact, exc)
+                return -1
+            continue
         if result.returncode == 0:
             _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
             return 0
@@ -105,11 +143,12 @@ def _run_sequential(
     failures = 0
     for artifact in artifacts:
         returncode = _run_with_retries(artifact, gpu_group, retry_budget)
+        stop_for_failure = returncode != 0 and not continue_on_failure
         if returncode != 0:
             failures += 1
-            if not continue_on_failure:
-                raise SystemExit(returncode)
         if on_trial_complete is not None and on_trial_complete(artifact, returncode):
+            break
+        if stop_for_failure:
             break
     return failures
 
@@ -219,7 +258,16 @@ def submit_trials_to_slurm(
         while True:
             attempts += 1
             _write_status(artifact, state="submitting", started_at=utc_now(), attempts=attempts)
-            result = subprocess.run(artifact.command)
+            try:
+                result = subprocess.run(artifact.command)
+            except OSError as exc:
+                if attempts > retry_budget:
+                    _write_launch_failure_status(artifact, exc)
+                    failures += 1
+                    if not continue_on_failure:
+                        raise SystemExit(1) from exc
+                    break
+                continue
             if result.returncode == 0:
                 _write_status(artifact, state="submitted", finished_at=utc_now(), returncode=0)
                 break
@@ -235,6 +283,45 @@ def submit_trials_to_slurm(
 EXIT_CODE_FILENAME = "exit_code"
 """Per-orchestrator returncode written by ``rl-multi-run``; the source of truth
 for per-trial failure attribution in multi_run_lora sweeps."""
+
+EVICTED_FILENAME = "evicted.txt"
+
+
+def _mark_inactive_multi_run_dirs_evicted(
+    shared_dir: Path,
+    active_run_dirs: list[Path],
+    *,
+    reason: str,
+) -> None:
+    """Make the trainer ignore stale ``run_*`` dirs outside the current launch.
+
+    ``rl-multi-run`` starts orchestrators only for the explicit ``--runs-dir``
+    list, but the trainer's ``MultiRunManager`` discovers every
+    ``<shared_dir>/run_*`` directory. Completed runs from earlier Optuna waves
+    or stale dirs from an old study must therefore be hidden before a fresh
+    launcher invocation, otherwise the trainer can allocate slots for runs
+    with no matching orchestrator process.
+    """
+    if not shared_dir.exists():
+        return
+
+    active = {run_dir.resolve() for run_dir in active_run_dirs}
+    for run_dir in shared_dir.glob("run_*"):
+        if not run_dir.is_dir() or run_dir.resolve() in active:
+            continue
+        control_dir = run_dir / "control"
+        control_dir.mkdir(parents=True, exist_ok=True)
+        evicted_path = control_dir / EVICTED_FILENAME
+        if not evicted_path.exists():
+            evicted_path.write_text(reason + "\n")
+
+
+def _reset_multi_run_artifact_runtime(artifact: TrialArtifacts) -> None:
+    """Clear per-attempt sidecars before launching a multi-run orchestrator."""
+    _reset_metrics_jsonl(artifact)
+    control_dir = artifact.run_dir / "control"
+    (control_dir / EXIT_CODE_FILENAME).unlink(missing_ok=True)
+    (control_dir / EVICTED_FILENAME).unlink(missing_ok=True)
 
 
 def _read_orchestrator_exit_code(artifact: TrialArtifacts) -> int | None:
@@ -299,6 +386,11 @@ def reconcile_multi_run_artifact(
     """
     status = _read_status(artifact)
     if status.get("state") == "pruned":
+        per_run_code = _read_orchestrator_exit_code(artifact)
+        effective = per_run_code if per_run_code is not None else aggregate_returncode
+        if effective == 0:
+            effective = -1
+        _write_status(artifact, state="pruned", finished_at=finished_at, returncode=effective)
         return "pruned"
 
     per_run_code = _read_orchestrator_exit_code(artifact)
@@ -322,6 +414,7 @@ def submit_trials_to_multi_run_lora(
     shared_paths: list[Path],
     shared_dir: Path,
     continue_on_failure: bool = True,
+    retry_budget: int = 1,
 ) -> int:
     """Launch one ``rl-multi-run`` invocation that drives every artifact in parallel.
 
@@ -333,8 +426,11 @@ def submit_trials_to_multi_run_lora(
     per orchestrator, and we reconcile per-trial state from those files
     (instead of marking every trial failed on a non-zero aggregate).
 
-    No retry loop: re-running a single failed orchestrator without
-    restarting the trainer needs dynamic slot replacement (Phase 7c).
+    Runtime failures are not retried: re-running a single failed
+    orchestrator without restarting the trainer needs dynamic slot
+    replacement (Phase 7c). Launcher spawn failures are different: no
+    shared trainer has started yet, so they are retried up to
+    ``retry_budget`` before the whole wave is marked failed.
     Phase 5b's ``FileMonitor`` sidecar metrics still work because
     ``rl-multi-run`` injects ``PRIME_RL_SWEEP_METRICS_JSONL`` per
     orchestrator; the controller reads each trial's
@@ -343,11 +439,29 @@ def submit_trials_to_multi_run_lora(
     """
     command = build_multi_run_command(artifacts, shared_paths, shared_dir)
 
-    started = utc_now()
-    for artifact in artifacts:
-        _write_status(artifact, state="running", started_at=started, attempts=1, gpu_group=None)
+    attempts = 0
+    while True:
+        attempts += 1
+        started = utc_now()
+        for artifact in artifacts:
+            _reset_multi_run_artifact_runtime(artifact)
+            _write_status(artifact, state="running", started_at=started, attempts=attempts, gpu_group=None)
+        _mark_inactive_multi_run_dirs_evicted(
+            shared_dir,
+            [artifact.run_dir for artifact in artifacts],
+            reason="Inactive run directory is not part of the current sweep wave.",
+        )
 
-    result = subprocess.run(command)
+        try:
+            result = subprocess.run(command)
+        except OSError as exc:
+            if attempts > retry_budget:
+                finished = utc_now()
+                for artifact in artifacts:
+                    _write_launch_failure_status(artifact, exc, finished_at=finished)
+                return len(artifacts)
+            continue
+        break
 
     finished = utc_now()
     failures = 0
@@ -358,6 +472,4 @@ def submit_trials_to_multi_run_lora(
         if state == "failed":
             failures += 1
 
-    if failures > 0 and not continue_on_failure:
-        raise SystemExit(result.returncode if result.returncode != 0 else 1)
     return failures

@@ -1,9 +1,12 @@
+import math
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import Discriminator, Field, Tag, model_validator
 
 from prime_rl.utils.config import BaseConfig
+
+OPTUNA_SEED_MAX = 2**32 - 1
 
 
 class ChoiceParameterConfig(BaseConfig):
@@ -16,6 +19,8 @@ class ChoiceParameterConfig(BaseConfig):
     def validate_values(self):
         if not self.values:
             raise ValueError("Sweep parameter values must be non-empty")
+        for idx, value in enumerate(self.values):
+            _validate_choice_value(value, f"values[{idx}]")
         return self
 
 
@@ -26,10 +31,20 @@ class UniformParameterConfig(BaseConfig):
     min: float
     max: float
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_bounds(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("min", "max"), "Uniform parameter")
+        return data
+
     @model_validator(mode="after")
     def validate_range(self):
+        if not math.isfinite(self.min) or not math.isfinite(self.max):
+            raise ValueError("Uniform parameter min and max must be finite")
         if self.min >= self.max:
             raise ValueError("Uniform parameter requires min < max")
+        if not math.isfinite(self.max - self.min):
+            raise ValueError("Uniform parameter range must be finite")
         return self
 
 
@@ -40,8 +55,16 @@ class LogUniformParameterConfig(BaseConfig):
     min: float
     max: float
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_bounds(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("min", "max"), "Log-uniform parameter")
+        return data
+
     @model_validator(mode="after")
     def validate_range(self):
+        if not math.isfinite(self.min) or not math.isfinite(self.max):
+            raise ValueError("Log-uniform parameter min and max must be finite")
         if self.min <= 0 or self.max <= 0:
             raise ValueError("Log-uniform parameter requires positive min and max")
         if self.min >= self.max:
@@ -56,6 +79,12 @@ class IntUniformParameterConfig(BaseConfig):
     min: int
     max: int
     step: Annotated[int, Field(ge=1)] = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_bounds(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("min", "max", "step"), "Int-uniform parameter")
+        return data
 
     @model_validator(mode="after")
     def validate_range(self):
@@ -86,6 +115,107 @@ SweepParameterConfig: TypeAlias = Annotated[
 ]
 
 
+def _validate_choice_value(value: Any, path: str) -> None:
+    """Validate that a choice value can be written to generated TOML."""
+    if value is None:
+        raise ValueError(
+            f"Sweep choice parameter {path} cannot be None; use the string 'None' for nullable target fields."
+        )
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Sweep choice parameter {path} must be finite")
+        return
+    if isinstance(value, str):
+        return
+    if isinstance(value, dict):
+        non_string_keys = [key for key in value if not isinstance(key, str)]
+        if non_string_keys:
+            raise ValueError(
+                f"Sweep choice parameter {path} has non-string TOML table key(s): {non_string_keys}"
+            )
+        for key, child in value.items():
+            _validate_choice_value(child, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, child in enumerate(value):
+            _validate_choice_value(child, f"{path}[{idx}]")
+        return
+    raise ValueError(
+        f"Sweep choice parameter {path} has value of type {type(value).__name__}, "
+        "which cannot be written to generated TOML."
+    )
+
+
+def _is_optuna_storage_safe_choice(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (bool, int, float, str)):
+        return not isinstance(value, float) or math.isfinite(value)
+    return False
+
+
+def _optuna_choices_are_equal(left: Any, right: Any) -> bool:
+    return left == right
+
+
+def _reject_bool_fields(data: Any, fields: tuple[str, ...], label: str) -> None:
+    if not isinstance(data, dict):
+        return
+    bool_fields = [field for field in fields if isinstance(data.get(field), bool)]
+    if bool_fields:
+        raise ValueError(f"{label} numeric field(s) cannot be boolean: {bool_fields}")
+
+
+def _choice_value_leaf_paths(parent_path: str, value: Any) -> list[str]:
+    if isinstance(value, dict):
+        if not value:
+            return [parent_path]
+        paths: list[str] = []
+        for key, child in value.items():
+            child_path = f"{parent_path}.{key}"
+            paths.extend(_choice_value_leaf_paths(child_path, child))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths: list[str] = []
+        for child in value:
+            if isinstance(child, (dict, list, tuple)):
+                paths.extend(_choice_value_leaf_paths(parent_path, child))
+        return paths or [parent_path]
+    return [parent_path]
+
+
+def _choice_value_leaf_items(parent_path: str, value: Any) -> list[tuple[str, Any]]:
+    if isinstance(value, dict):
+        if not value:
+            return [(parent_path, value)]
+        items: list[tuple[str, Any]] = []
+        for key, child in value.items():
+            child_path = f"{parent_path}.{key}"
+            items.extend(_choice_value_leaf_items(child_path, child))
+        return items
+    if isinstance(value, (list, tuple)):
+        items: list[tuple[str, Any]] = []
+        for child in value:
+            if isinstance(child, (dict, list, tuple)):
+                items.extend(_choice_value_leaf_items(parent_path, child))
+        return items or [(parent_path, value)]
+    return [(parent_path, value)]
+
+
+def _effective_parameter_paths(parameters: dict[str, "SweepParameterConfig"]) -> tuple[str, ...]:
+    paths: list[str] = []
+    for path, parameter in parameters.items():
+        paths.append(path)
+        if isinstance(parameter, ChoiceParameterConfig):
+            for value in parameter.values:
+                paths.extend(_choice_value_leaf_paths(path, value))
+    return tuple(dict.fromkeys(paths))
+
+
 class GridStrategyConfig(BaseConfig):
     """Exhaustive grid over choice-valued parameters."""
 
@@ -98,6 +228,12 @@ class RandomStrategyConfig(BaseConfig):
     type: Literal["random"] = "random"
     num_trials: Annotated[int, Field(ge=1, description="Number of trials to draw.")]
     seed: Annotated[int | None, Field(description="Optional seed for reproducibility.")] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("num_trials", "seed"), "Random strategy")
+        return data
 
 
 class NoPrunerConfig(BaseConfig):
@@ -124,6 +260,16 @@ class MedianPrunerConfig(BaseConfig):
         Field(ge=1, description="Pruning is only checked every Nth reported step."),
     ] = 1
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(
+            data,
+            ("n_startup_trials", "n_warmup_steps", "interval_steps"),
+            "Median pruner",
+        )
+        return data
+
 
 class AshaPrunerConfig(BaseConfig):
     """Optuna's SuccessiveHalvingPruner (ASHA). Promotes trials whose intermediate
@@ -143,6 +289,22 @@ class AshaPrunerConfig(BaseConfig):
         Field(ge=0, description="Bracket index offset; 0 enables the most aggressive bracket."),
     ] = 0
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(
+            data,
+            ("min_resource", "reduction_factor", "min_early_stopping_rate"),
+            "ASHA pruner",
+        )
+        return data
+
+    @model_validator(mode="after")
+    def validate_min_resource(self):
+        if isinstance(self.min_resource, int) and self.min_resource < 1:
+            raise ValueError("ASHA pruner min_resource must be >= 1 or 'auto'")
+        return self
+
 
 class HyperbandPrunerConfig(BaseConfig):
     """Optuna's HyperbandPruner: runs successive-halving across multiple brackets."""
@@ -160,6 +322,22 @@ class HyperbandPrunerConfig(BaseConfig):
         int,
         Field(ge=2, description="At each rung, keep the top 1/reduction_factor of trials."),
     ] = 3
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(
+            data,
+            ("min_resource", "max_resource", "reduction_factor"),
+            "Hyperband pruner",
+        )
+        return data
+
+    @model_validator(mode="after")
+    def validate_resources(self):
+        if isinstance(self.max_resource, int) and self.max_resource < self.min_resource:
+            raise ValueError("Hyperband pruner max_resource must be >= min_resource or 'auto'")
+        return self
 
 
 PrunerConfig: TypeAlias = Annotated[
@@ -205,6 +383,22 @@ class OptunaStrategyConfig(BaseConfig):
         ),
     ] = 5.0
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("num_trials", "seed", "poll_interval_seconds"), "Optuna strategy")
+        return data
+
+    @model_validator(mode="after")
+    def validate_optuna_fields(self):
+        if not math.isfinite(self.poll_interval_seconds):
+            raise ValueError("Optuna poll_interval_seconds must be finite")
+        if self.seed is not None and not 0 <= self.seed <= OPTUNA_SEED_MAX:
+            raise ValueError(f"Optuna seed must be between 0 and {OPTUNA_SEED_MAX}")
+        if self.storage is not None and not self.storage.strip():
+            raise ValueError("Optuna storage must be a non-empty SQLAlchemy URL when set")
+        return self
+
 
 SearchStrategyConfig: TypeAlias = Annotated[
     GridStrategyConfig | RandomStrategyConfig | OptunaStrategyConfig,
@@ -228,6 +422,25 @@ class LocalGpuAssignmentConfig(BaseConfig):
         Field(min_length=1, description="Disjoint device groups assigned to parallel workers."),
     ]
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_devices(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        groups = data.get("visible_devices")
+        if not isinstance(groups, list):
+            return data
+        for group_idx, group in enumerate(groups):
+            if not isinstance(group, list):
+                continue
+            for device_idx, device in enumerate(group):
+                if isinstance(device, bool):
+                    raise ValueError(
+                        "Local GPU assignment visible_devices entries cannot be boolean: "
+                        f"visible_devices[{group_idx}][{device_idx}]"
+                    )
+        return data
+
     @model_validator(mode="after")
     def validate_groups(self):
         if any(not group for group in self.visible_devices):
@@ -250,6 +463,12 @@ class LocalSweepSchedulerConfig(BaseConfig):
         LocalGpuAssignmentConfig | None,
         Field(description="Required for max_parallel > 1; pins each worker to a disjoint device group."),
     ] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("max_parallel",), "Local scheduler")
+        return data
 
     @model_validator(mode="after")
     def validate_parallel(self):
@@ -281,20 +500,147 @@ class SlurmSweepSchedulerConfig(BaseConfig):
 
 
 # Parameter paths a multi_run_lora sweep is allowed to vary. Must stay in
-# sync with what the trainer's MultiRunManager treats as per-run-safe; see
+# sync with both the OrchestratorConfig schema (paths must actually resolve)
+# and what the trainer's MultiRunManager treats as per-run-safe; see
 # src/prime_rl/trainer/runs.py for the runtime validation hook. Anything
 # under trainer.*, model.*, deployment.*, or inference.* is shared across
 # runs and would silently mismatch between trials, so it is rejected at
 # config-load time.
+#
+# Prefixes match arbitrary dict subtrees (paths must continue under them);
+# fields match concrete schema leaves exactly. Splitting them avoids letting
+# bogus paths like ``orchestrator.batch_size_extra`` slip through a
+# startswith check.
+#
+# Targets that resolve to a list (e.g. ``orchestrator.train.env``,
+# ``orchestrator.eval.env``) cannot be allowlisted: the sweep materializer's
+# ``set_dotted_path`` only walks dict tables, so a path like
+# ``orchestrator.train.env.id`` would produce a dict-shaped override that
+# RLConfig rejects with "Input should be a valid list".
+#
+# Fields coupled to the shared trainer (e.g. ``orchestrator.max_steps`` and
+# ``orchestrator.max_async_level``) are intentionally not allowlisted. The
+# shared trainer owns the actual loop length and weight-broadcast retention
+# window for all runs in the wave.
 MULTI_RUN_LORA_PARAMETER_PREFIXES: tuple[str, ...] = (
-    "orchestrator.optim.",
-    "orchestrator.model.lora.",
-    "orchestrator.sampling.",
-    "orchestrator.environment.",
-    "orchestrator.batch.",
-    "orchestrator.buffer.",
-    "orchestrator.eval.",
+    "orchestrator.train.sampling.extra_body.",
+    "orchestrator.eval.sampling.extra_body.",
 )
+MULTI_RUN_LORA_PARAMETER_FIELDS: frozenset[str] = frozenset(
+    {
+        "orchestrator.optim.lr",
+        "orchestrator.model.lora.name",
+        "orchestrator.model.lora.rank",
+        "orchestrator.model.lora.alpha",
+        "orchestrator.batch_size",
+        "orchestrator.token_batch_size",
+        "orchestrator.oversampling_factor",
+        "orchestrator.max_inflight_rollouts",
+        "orchestrator.rollouts_per_example",
+        "orchestrator.max_off_policy_steps",
+        "orchestrator.strict_async_level",
+        "orchestrator.seed",
+        "orchestrator.tasks_per_minute",
+        "orchestrator.train.sampling",
+        "orchestrator.train.sampling.temperature",
+        "orchestrator.train.sampling.repetition_penalty",
+        "orchestrator.train.sampling.max_completion_tokens",
+        "orchestrator.train.sampling.max_tokens",
+        "orchestrator.train.sampling.min_tokens",
+        "orchestrator.train.sampling.seed",
+        "orchestrator.train.sampling.extra_body",
+        "orchestrator.train.num_workers",
+        "orchestrator.train.max_retries",
+        "orchestrator.eval.sampling",
+        "orchestrator.eval.sampling.temperature",
+        "orchestrator.eval.sampling.repetition_penalty",
+        "orchestrator.eval.sampling.top_p",
+        "orchestrator.eval.sampling.top_k",
+        "orchestrator.eval.sampling.min_p",
+        "orchestrator.eval.sampling.max_completion_tokens",
+        "orchestrator.eval.sampling.max_tokens",
+        "orchestrator.eval.sampling.min_tokens",
+        "orchestrator.eval.sampling.reasoning_effort",
+        "orchestrator.eval.sampling.seed",
+        "orchestrator.eval.sampling.extra_body",
+        "orchestrator.eval.num_examples",
+        "orchestrator.eval.rollouts_per_example",
+        "orchestrator.eval.num_workers",
+        "orchestrator.eval.max_retries",
+        "orchestrator.eval.interval",
+        "orchestrator.eval.eval_base_model",
+        "orchestrator.eval.skip_eval_on_resume",
+        "orchestrator.eval.cancel_inflight_rollouts_on_eval",
+        # BufferConfig: scalar leaves, plus hash_keys as a whole-list swap.
+        # Sub-paths under hash_keys (it's a list[str]) are unreachable via
+        # set_dotted_path, so only the exact field is allowlisted.
+        "orchestrator.buffer.seed",
+        "orchestrator.buffer.easy_threshold",
+        "orchestrator.buffer.hard_threshold",
+        "orchestrator.buffer.easy_fraction",
+        "orchestrator.buffer.hard_fraction",
+        "orchestrator.buffer.online_difficulty_filtering",
+        "orchestrator.buffer.hash_keys",
+    }
+)
+MULTI_RUN_LORA_LIST_PARAMETER_FIELDS: frozenset[str] = frozenset({"orchestrator.buffer.hash_keys"})
+MULTI_RUN_LORA_DICT_PARAMETER_FIELDS: frozenset[str] = frozenset(
+    {
+        "orchestrator.train.sampling",
+        "orchestrator.train.sampling.extra_body",
+        "orchestrator.eval.sampling",
+        "orchestrator.eval.sampling.extra_body",
+    }
+)
+MULTI_RUN_LORA_SCALAR_PARAMETER_FIELDS: frozenset[str] = (
+    MULTI_RUN_LORA_PARAMETER_FIELDS
+    - MULTI_RUN_LORA_LIST_PARAMETER_FIELDS
+    - MULTI_RUN_LORA_DICT_PARAMETER_FIELDS
+)
+
+
+def _multi_run_lora_exact_field_shape_errors(parameters: dict[str, SweepParameterConfig]) -> list[str]:
+    errors: list[str] = []
+    for path, parameter in parameters.items():
+        if path.startswith(MULTI_RUN_LORA_PARAMETER_PREFIXES):
+            continue
+        if path not in MULTI_RUN_LORA_PARAMETER_FIELDS:
+            continue
+        if not isinstance(parameter, ChoiceParameterConfig):
+            if path in MULTI_RUN_LORA_LIST_PARAMETER_FIELDS or path in MULTI_RUN_LORA_DICT_PARAMETER_FIELDS:
+                errors.append(f"{path}: list/table fields must use explicit choice values")
+            continue
+        leaf_values: dict[str, list[Any]] = {}
+        for value in parameter.values:
+            leaf_items = _choice_value_leaf_items(path, value)
+            if all(leaf_path != path for leaf_path, _ in leaf_items):
+                leaf_values.setdefault(path, []).append(value)
+            for leaf_path, leaf_value in leaf_items:
+                leaf_values.setdefault(leaf_path, []).append(leaf_value)
+        for leaf_path, values in leaf_values.items():
+            if leaf_path.startswith(MULTI_RUN_LORA_PARAMETER_PREFIXES):
+                continue
+            if leaf_path not in MULTI_RUN_LORA_PARAMETER_FIELDS:
+                continue
+            if leaf_path in MULTI_RUN_LORA_SCALAR_PARAMETER_FIELDS:
+                bad_values = [value for value in values if isinstance(value, (dict, list, tuple))]
+                if bad_values:
+                    errors.append(f"{leaf_path}: scalar field cannot use structured choice value(s) {bad_values!r}")
+            elif leaf_path in MULTI_RUN_LORA_LIST_PARAMETER_FIELDS:
+                bad_values = [
+                    value
+                    for value in values
+                    if not isinstance(value, (list, tuple))
+                    or not value
+                    or any(not isinstance(item, str) for item in value)
+                ]
+                if bad_values:
+                    errors.append(f"{leaf_path}: must use non-empty list[str] choice value(s), got {bad_values!r}")
+            elif leaf_path in MULTI_RUN_LORA_DICT_PARAMETER_FIELDS:
+                bad_values = [value for value in values if not isinstance(value, dict)]
+                if bad_values:
+                    errors.append(f"{leaf_path}: must use table/dict choice value(s), got {bad_values!r}")
+    return errors
 
 
 class MultiRunLoRASchedulerConfig(BaseConfig):
@@ -330,6 +676,12 @@ class MultiRunLoRASchedulerConfig(BaseConfig):
         ),
     ]
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("max_concurrent_runs",), "multi_run_lora scheduler")
+        return data
+
 
 SweepSchedulerConfig: TypeAlias = Annotated[
     LocalSweepSchedulerConfig | SlurmSweepSchedulerConfig | MultiRunLoRASchedulerConfig,
@@ -355,6 +707,12 @@ class ObjectiveConfig(BaseConfig):
     direction: Literal["maximize", "minimize"]
     source: Literal["final_summary"] = "final_summary"
 
+    @model_validator(mode="after")
+    def validate_metric(self):
+        if not self.metric.strip():
+            raise ValueError("objective.metric must be non-empty")
+        return self
+
 
 class ThresholdStoppingConfig(BaseConfig):
     """Halt the study after a trial whose objective is on the wrong side of a threshold."""
@@ -366,6 +724,18 @@ class ThresholdStoppingConfig(BaseConfig):
         Field(ge=1, description="Minimum completed trials before threshold can fire."),
     ] = 1
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("threshold", "min_trials"), "Early-stopping threshold")
+        return data
+
+    @model_validator(mode="after")
+    def validate_threshold(self):
+        if not math.isfinite(self.threshold):
+            raise ValueError("Early-stopping threshold must be finite")
+        return self
+
 
 class PatienceStoppingConfig(BaseConfig):
     """Halt the study after N consecutive completed trials with no improvement."""
@@ -376,6 +746,12 @@ class PatienceStoppingConfig(BaseConfig):
         int,
         Field(ge=1, description="Minimum completed trials before patience can fire."),
     ] = 1
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("patience", "min_trials"), "Patience early stopping")
+        return data
 
 
 EarlyStoppingConfig: TypeAlias = Annotated[
@@ -412,12 +788,71 @@ class SweepConfig(BaseConfig):
     dry_run: bool = False
     clean_output_dir: bool = False
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_bool_numeric_fields(cls, data: Any) -> Any:
+        _reject_bool_fields(data, ("retry_budget",), "Sweep")
+        return data
+
     @model_validator(mode="after")
     def validate_sweep(self):
         if not self.base:
             raise ValueError("Sweep base must include at least one target config file")
         if not self.parameters:
             raise ValueError("Sweep parameters must include at least one parameter")
+        paths = tuple(self.parameters)
+        effective_paths = _effective_parameter_paths(self.parameters)
+        effective_path_set = set(effective_paths)
+        invalid_paths = [
+            path for path in effective_paths if not path or any(not part for part in path.split("."))
+        ]
+        if invalid_paths:
+            raise ValueError(
+                "Sweep parameter paths must be non-empty dot-separated config segments. "
+                f"Invalid path(s): {invalid_paths}"
+            )
+        output_dir_paths = [path for path in effective_paths if "output_dir" in path.split(".")]
+        if output_dir_paths:
+            raise ValueError(
+                "Sweep parameters cannot set output_dir fields; "
+                "the sweep materializer owns each trial's output directories. "
+                f"Invalid path(s): {output_dir_paths}"
+            )
+        if self.wandb is not None and self.wandb.enabled:
+            managed_wandb_paths = ("wandb.group", "wandb.name", "wandb.tags")
+            managed_component_wandb_paths = tuple(
+                f"{component}.wandb.{field}"
+                for component in ("trainer", "orchestrator")
+                for field in ("project", "entity", "name", "group", "tags", "offline")
+            )
+            managed_component_wandb_tables = ("trainer.wandb", "orchestrator.wandb")
+            wandb_paths = [
+                path
+                for path in effective_paths
+                if path == "wandb"
+                or any(path == managed or path.startswith(f"{managed}.") for managed in managed_wandb_paths)
+                or path in managed_component_wandb_tables
+                or any(
+                    path == managed or path.startswith(f"{managed}.")
+                    for managed in managed_component_wandb_paths
+                )
+            ]
+            if wandb_paths:
+                raise ValueError(
+                    "Sweep parameters cannot set sweep-managed W&B identity/shared fields while sweep wandb "
+                    f"injection is enabled. Disable [wandb] injection or remove path(s): {wandb_paths}"
+                )
+        path_conflicts = [
+            (parent, child)
+            for parent in paths
+            for child in paths
+            if parent != child and child.startswith(f"{parent}.")
+        ]
+        if path_conflicts:
+            raise ValueError(
+                "Sweep parameters cannot include both a parent path and one of its sub-paths: "
+                f"{path_conflicts}. Split these into separate sweeps or choose one override shape."
+            )
         if self.resume and self.clean_output_dir:
             raise ValueError("resume and clean_output_dir are mutually exclusive")
         if isinstance(self.strategy, GridStrategyConfig):
@@ -443,6 +878,16 @@ class SweepConfig(BaseConfig):
                 "early_stopping is not supported with the SLURM scheduler: the controller submits "
                 "jobs and exits, so it never observes trial completion to decide when to halt."
             )
+        if (
+            self.early_stopping is not None
+            and isinstance(self.scheduler, MultiRunLoRASchedulerConfig)
+            and not isinstance(self.strategy, OptunaStrategyConfig)
+        ):
+            raise ValueError(
+                "early_stopping is not supported with static multi_run_lora sweeps: the controller "
+                "launches the whole grid/random wave at once, so it cannot stop future trials. "
+                "Use the Optuna strategy for wave-by-wave multi_run_lora early stopping."
+            )
         if isinstance(self.strategy, OptunaStrategyConfig):
             if self.objective is None:
                 raise ValueError("Optuna strategy requires an objective to optimize.")
@@ -461,6 +906,33 @@ class SweepConfig(BaseConfig):
                     "Resume with the Optuna strategy requires strategy.storage so the study "
                     "can be reloaded; in-memory studies vanish when the controller exits."
                 )
+            storage_unsafe_choice_paths = [
+                path
+                for path, parameter in self.parameters.items()
+                if isinstance(parameter, ChoiceParameterConfig)
+                and not all(_is_optuna_storage_safe_choice(value) for value in parameter.values)
+            ]
+            if storage_unsafe_choice_paths:
+                raise ValueError(
+                    "Optuna categorical parameters only support storage-safe primitive choices "
+                    f"(bool, int, finite float, or str). Invalid parameter path(s): {storage_unsafe_choice_paths}"
+                )
+            ambiguous_choice_paths = []
+            for path, parameter in self.parameters.items():
+                if not isinstance(parameter, ChoiceParameterConfig):
+                    continue
+                if any(
+                    _optuna_choices_are_equal(left, right)
+                    for idx, left in enumerate(parameter.values)
+                    for right in parameter.values[idx + 1 :]
+                ):
+                    ambiguous_choice_paths.append(path)
+            if ambiguous_choice_paths:
+                raise ValueError(
+                    "Optuna categorical parameters cannot include duplicate or equality-colliding "
+                    f"choices because Optuna storage cannot distinguish them. Invalid parameter path(s): "
+                    f"{ambiguous_choice_paths}"
+                )
         if isinstance(self.scheduler, MultiRunLoRASchedulerConfig):
             if self.entrypoint != "rl":
                 raise ValueError(
@@ -475,14 +947,47 @@ class SweepConfig(BaseConfig):
                 )
             offending = [
                 path
-                for path in self.parameters
-                if not any(path.startswith(prefix) for prefix in MULTI_RUN_LORA_PARAMETER_PREFIXES)
+                for path in effective_paths
+                if path not in MULTI_RUN_LORA_PARAMETER_FIELDS
+                and not any(path.startswith(prefix) for prefix in MULTI_RUN_LORA_PARAMETER_PREFIXES)
             ]
             if offending:
-                allowed = ", ".join(MULTI_RUN_LORA_PARAMETER_PREFIXES)
+                allowed = ", ".join(
+                    (*MULTI_RUN_LORA_PARAMETER_PREFIXES, *sorted(MULTI_RUN_LORA_PARAMETER_FIELDS))
+                )
                 raise ValueError(
                     "multi_run_lora sweeps may only vary per-run orchestrator fields. "
                     f"These parameter paths are not in the allowlist ({allowed}): {offending}. "
                     "Trainer/model/deployment/inference settings cannot vary inside one shared trainer."
                 )
+            shape_errors = _multi_run_lora_exact_field_shape_errors(self.parameters)
+            if shape_errors:
+                raise ValueError(
+                    "multi_run_lora exact-field sweep parameters must match the allowlisted field shape. "
+                    f"Invalid value(s): {shape_errors}"
+                )
+            if (
+                "orchestrator.batch_size" in self.parameters
+                and "orchestrator.token_batch_size" in self.parameters
+            ):
+                raise ValueError(
+                    "multi_run_lora sweeps must set either orchestrator.batch_size or "
+                    "orchestrator.token_batch_size, not both."
+                )
+            if (
+                "orchestrator.token_batch_size" in self.parameters
+                and "orchestrator.oversampling_factor" in self.parameters
+            ):
+                raise ValueError(
+                    "multi_run_lora sweeps cannot set orchestrator.oversampling_factor with "
+                    "orchestrator.token_batch_size; oversampling only applies to rollout batching."
+                )
+            for prefix in ("orchestrator.train.sampling", "orchestrator.eval.sampling"):
+                has_canonical = f"{prefix}.max_completion_tokens" in effective_path_set
+                has_alias = f"{prefix}.max_tokens" in effective_path_set
+                if has_canonical and has_alias:
+                    raise ValueError(
+                        f"multi_run_lora sweeps must set either {prefix}.max_completion_tokens "
+                        f"or {prefix}.max_tokens, not both."
+                    )
         return self

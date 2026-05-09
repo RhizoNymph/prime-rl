@@ -31,7 +31,7 @@ def _final_summary_paths(run_dir: Path) -> list[Path]:
     return sorted(run_dir.glob("run-*/final_summary.json"))
 
 
-def _coerce_to_float(value: Any) -> float | None:
+def coerce_finite_float(value: Any) -> float | None:
     """Return ``value`` as a finite float, or ``None`` for anything else.
 
     NaN / +Inf / -Inf are rejected because they break later improvement and
@@ -42,13 +42,40 @@ def _coerce_to_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        scalar = float(value)
+        try:
+            scalar = float(value)
+        except OverflowError:
+            return None
         return scalar if math.isfinite(scalar) else None
     return None
 
 
 def _metrics_jsonl_path(run_dir: Path) -> Path:
     return run_dir / "metrics.jsonl"
+
+
+def _valid_step(row: dict[str, Any]) -> bool:
+    step = row.get("step")
+    return isinstance(step, int) and not isinstance(step, bool) and step >= 0
+
+
+def _step_sort_key(row: dict[str, Any]) -> int:
+    return row["step"] if _valid_step(row) else -1
+
+
+def _latest_metric_row(
+    rows: list[dict[str, Any]],
+    metric: str,
+    *,
+    require_valid_step: bool,
+) -> dict[str, Any] | None:
+    rows_with_metric = [(idx, row) for idx, row in enumerate(rows) if metric in row]
+    if require_valid_step:
+        rows_with_metric = [(idx, row) for idx, row in rows_with_metric if _valid_step(row)]
+    if not rows_with_metric:
+        return None
+    _, latest = max(rows_with_metric, key=lambda item: (_step_sort_key(item[1]), item[0]))
+    return latest
 
 
 def _iter_metrics_rows(run_dir: Path) -> list[dict[str, Any]]:
@@ -90,17 +117,21 @@ def read_final_summary(run_dir: Path, metric: str) -> float | None:
     """
     rows = _iter_metrics_rows(run_dir)
     if rows:
-        rows_with_metric = [row for row in rows if metric in row]
-        if rows_with_metric:
-            latest = max(rows_with_metric, key=lambda r: r.get("step", -1))
-            return _coerce_to_float(latest.get(metric))
+        latest = _latest_metric_row(rows, metric, require_valid_step=True)
+        if latest is not None:
+            return coerce_finite_float(latest.get(metric))
 
     paths = _final_summary_paths(run_dir)
     if not paths:
         return None
     paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    summary = json.loads(paths[0].read_text())
-    return _coerce_to_float(summary.get(metric))
+    try:
+        summary = json.loads(paths[0].read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    return coerce_finite_float(summary.get(metric))
 
 
 def read_intermediate_metric(run_dir: Path, metric: str) -> tuple[int, float] | None:
@@ -114,14 +145,11 @@ def read_intermediate_metric(run_dir: Path, metric: str) -> tuple[int, float] | 
     rows = _iter_metrics_rows(run_dir)
     if not rows:
         return None
-    rows_with_metric = [row for row in rows if metric in row]
-    if not rows_with_metric:
+    latest = _latest_metric_row(rows, metric, require_valid_step=True)
+    if latest is None:
         return None
-    latest = max(rows_with_metric, key=lambda r: r.get("step", -1))
-    value = _coerce_to_float(latest.get(metric))
+    value = coerce_finite_float(latest.get(metric))
     if value is None:
         return None
     raw_step = latest.get("step")
-    if not isinstance(raw_step, int) or isinstance(raw_step, bool):
-        return None
     return raw_step, value

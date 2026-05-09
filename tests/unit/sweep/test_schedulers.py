@@ -8,7 +8,11 @@ import tomli_w
 
 from prime_rl.configs.sweep import SweepConfig
 from prime_rl.sweep.materialize import Trial, materialize_trial
-from prime_rl.sweep.schedulers import run_trials_locally
+from prime_rl.sweep.schedulers import (
+    run_trials_locally,
+    submit_trials_to_multi_run_lora,
+    submit_trials_to_slurm,
+)
 
 
 def _materialize(tmp_path: Path, count: int) -> tuple[SweepConfig, list]:
@@ -116,3 +120,148 @@ def test_parallel_run_records_failures_and_continues(tmp_path: Path, monkeypatch
     )
 
     assert failures > 0
+
+
+def test_local_run_marks_launch_oserror_failed(tmp_path: Path, monkeypatch) -> None:
+    _, artifacts = _materialize(tmp_path, count=1)
+
+    def fake_run(_command, env=None):
+        raise FileNotFoundError("missing launcher")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = run_trials_locally(artifacts, retry_budget=0)
+
+    assert failures == 1
+    status = json.loads(artifacts[0].status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["returncode"] == -1
+    assert status["failure_stage"] == "launch"
+    assert "FileNotFoundError" in status["error"]
+
+
+def test_local_run_retries_launch_oserror(tmp_path: Path, monkeypatch) -> None:
+    _, artifacts = _materialize(tmp_path, count=1)
+    attempts = 0
+
+    def fake_run(_command, env=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError("temporary launcher miss")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = run_trials_locally(artifacts, retry_budget=1)
+
+    assert failures == 0
+    assert attempts == 2
+    status = json.loads(artifacts[0].status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
+    assert status["attempts"] == 2
+    assert "failure_stage" not in status
+
+
+def test_slurm_submission_marks_launch_oserror_failed(tmp_path: Path, monkeypatch) -> None:
+    _, artifacts = _materialize(tmp_path, count=1)
+
+    def fake_run(_command):
+        raise FileNotFoundError("missing sbatch wrapper")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_slurm(artifacts, retry_budget=0)
+
+    assert failures == 1
+    status = json.loads(artifacts[0].status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["returncode"] == -1
+    assert status["failure_stage"] == "launch"
+
+
+def test_slurm_submission_retries_launch_oserror(tmp_path: Path, monkeypatch) -> None:
+    _, artifacts = _materialize(tmp_path, count=1)
+    attempts = 0
+
+    def fake_run(_command):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError("temporary sbatch wrapper miss")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_slurm(artifacts, retry_budget=1)
+
+    assert failures == 0
+    assert attempts == 2
+    status = json.loads(artifacts[0].status_path.read_text())
+    assert status["state"] == "submitted"
+    assert status["returncode"] == 0
+    assert status["attempts"] == 2
+    assert "failure_stage" not in status
+
+
+def test_multi_run_lora_marks_all_artifacts_failed_on_launcher_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, artifacts = _materialize(tmp_path, count=2)
+
+    def fake_run(_command):
+        raise FileNotFoundError("missing rl-multi-run")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_multi_run_lora(
+        artifacts,
+        shared_paths=[tmp_path / "shared.toml"],
+        shared_dir=tmp_path / "shared",
+        retry_budget=0,
+    )
+
+    assert failures == 2
+    for artifact in artifacts:
+        status = json.loads(artifact.status_path.read_text())
+        assert status["state"] == "failed"
+        assert status["returncode"] == -1
+        assert status["failure_stage"] == "launch"
+
+
+def test_multi_run_lora_retries_launcher_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, artifacts = _materialize(tmp_path, count=2)
+    attempts = 0
+
+    def fake_run(command):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise FileNotFoundError("temporary rl-multi-run miss")
+        runs_idx = command.index("--runs-dir")
+        for raw_run_dir in command[runs_idx + 1].split(":"):
+            control_dir = Path(raw_run_dir) / "control"
+            control_dir.mkdir(parents=True, exist_ok=True)
+            (control_dir / "exit_code").write_text("0\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_multi_run_lora(
+        artifacts,
+        shared_paths=[tmp_path / "shared.toml"],
+        shared_dir=tmp_path / "shared",
+        retry_budget=1,
+    )
+
+    assert failures == 0
+    assert attempts == 2
+    for artifact in artifacts:
+        status = json.loads(artifact.status_path.read_text())
+        assert status["state"] == "completed"
+        assert status["returncode"] == 0
+        assert status["attempts"] == 2
+        assert "failure_stage" not in status

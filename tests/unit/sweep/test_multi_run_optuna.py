@@ -124,7 +124,9 @@ class _FakePopen:
     tick. ``poll()`` returns ``None`` for the first call (the poll loop runs
     once) and ``0`` thereafter; on the transition it writes
     ``<run_dir>/control/exit_code`` for every survivor, mirroring what the
-    real launcher does in production.
+    real launcher does in production. The threshold leaves enough live
+    ``poll()`` calls for the controller's per-artifact pre-prune liveness
+    checks during the first polling pass.
 
     Non-``rl-multi-run`` invocations (e.g. ``git rev-parse`` for the manifest's
     git metadata) are delegated to the real ``subprocess.Popen`` — patching
@@ -133,6 +135,7 @@ class _FakePopen:
     """
 
     instances: list["_FakePopen"] = []
+    failed_trial_indices: set[int] = set()
     _real_popen = None  # populated by _install_fake_optuna_runtime
 
     def __new__(cls, command, **kwargs):
@@ -163,17 +166,20 @@ class _FakePopen:
 
     def poll(self) -> int | None:
         self._poll_count += 1
-        if self._poll_count == 1:
+        if self._poll_count < len(self.run_dirs) + 3:
             return None
-        # On the second poll, simulate the launcher writing exit_codes and
-        # exiting cleanly. Pruned trials had their orch exit with non-zero
-        # in production; the controller pre-marked them so reconcile won't
-        # read the exit_code anyway, but we still write 1 for diagnostics.
+        # After one full live polling pass, simulate the launcher writing
+        # exit_codes and exiting cleanly. Pruned trials had their orch exit
+        # with non-zero in production; the controller pre-marked them so
+        # reconcile won't read the exit_code anyway, but we still write 1
+        # for diagnostics.
         for run_dir in self.run_dirs:
             (run_dir / "control").mkdir(parents=True, exist_ok=True)
             status_path = run_dir / "status.json"
             status = json.loads(status_path.read_text()) if status_path.exists() else {}
-            code = "1\n" if status.get("state") == "pruned" else "0\n"
+            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
+            should_fail = status.get("state") == "pruned" or trial_index in self.failed_trial_indices
+            code = "1\n" if should_fail else "0\n"
             (run_dir / "control" / "exit_code").write_text(code)
         self.returncode = 0
         return 0
@@ -196,6 +202,7 @@ def _install_fake_optuna_runtime(monkeypatch, study: _StudyStub) -> None:
     monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(multi_run_mod.time, "sleep", lambda *_a, **_kw: None)
     _FakePopen.instances.clear()
+    _FakePopen.failed_trial_indices = set()
 
 
 def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
@@ -264,6 +271,8 @@ def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
     assert (pruned_run_dir / "control" / "evicted.txt").exists()
     pruned_status = json.loads((pruned_run_dir / "status.json").read_text())
     assert pruned_status["state"] == "pruned"
+    assert pruned_status["returncode"] == 1
+    assert "finished_at" in pruned_status
     assert pruned_status["pruned_at_step"] == 1
     assert pruned_status["pruned_reason"].startswith("optuna prune")
 
@@ -279,6 +288,196 @@ def test_multi_run_optuna_wave_prunes_one_trial_and_completes_others(
         trial_idx = int(variant["id"].split("-", 1)[0])
         states_by_index[trial_idx] = json.loads(Path(variant["status_path"]).read_text())["state"]
     assert states_by_index == {0: "completed", 1: "pruned", 2: "completed"}
+
+
+def test_multi_run_optuna_does_not_prune_after_wave_exits(tmp_path: Path, monkeypatch) -> None:
+    """If the wave exits after the poll-loop guard, final reconciliation wins."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    study._on_ask = lambda trial: setattr(trial, "should_prune_returns", True)
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    class _ExitBeforePrunePopen(_FakePopen):
+        def poll(self) -> int | None:
+            self._poll_count += 1
+            if self._poll_count == 1:
+                return None
+            for run_dir in self.run_dirs:
+                (run_dir / "control").mkdir(parents=True, exist_ok=True)
+                (run_dir / "control" / "exit_code").write_text("0\n")
+            self.returncode = 0
+            return 0
+
+    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _ExitBeforePrunePopen)
+
+    config = SweepConfig(
+        name="lora-optuna-exit-before-prune",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "pruner": {"type": "median", "n_startup_trials": 0, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert len(study.tells) == 1
+    trial, value, state = study.tells[0]
+    assert trial.number == 0
+    assert value == 0.5
+    assert state is None
+
+    run_dir = _FakePopen.instances[0].run_dirs[0]
+    assert not (run_dir / "control" / "evicted.txt").exists()
+    status = json.loads((run_dir / "status.json").read_text())
+    assert status["state"] == "completed"
+    assert status["objective"] == 0.5
+
+
+def test_multi_run_optuna_does_not_prune_run_with_recorded_exit_code(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A completed orchestrator can finish before sibling runs keep the wave alive."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    study._on_ask = lambda trial: setattr(trial, "should_prune_returns", True)
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    class _CompletedRunOpenWavePopen(_FakePopen):
+        def __init__(self, command, **kwargs) -> None:
+            super().__init__(command, **kwargs)
+            for run_dir in self.run_dirs:
+                (run_dir / "control").mkdir(parents=True, exist_ok=True)
+                (run_dir / "control" / "exit_code").write_text("0\n")
+
+    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", _CompletedRunOpenWavePopen)
+
+    config = SweepConfig(
+        name="lora-optuna-completed-run-open-wave",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "pruner": {"type": "median", "n_startup_trials": 0, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert len(study.tells) == 1
+    trial, value, state = study.tells[0]
+    assert trial.number == 0
+    assert trial.reports == []
+    assert value == 0.5
+    assert state is None
+
+    run_dir = _FakePopen.instances[0].run_dirs[0]
+    assert not (run_dir / "control" / "evicted.txt").exists()
+    status = json.loads((run_dir / "status.json").read_text())
+    assert status["state"] == "completed"
+    assert status["objective"] == 0.5
+
+
+def test_multi_run_optuna_does_not_prune_when_exit_code_appears_after_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A run can finish after the initial exit-code check but before the
+    pruning decision. Re-read exit_code so final reconciliation wins."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    class _ExitCodeAfterReportTrial(_TrialStub):
+        def report(self, value: float, step: int) -> None:
+            super().report(value, step)
+            run_dir = _FakePopen.instances[0].run_dirs[self.number]
+            (run_dir / "control").mkdir(parents=True, exist_ok=True)
+            (run_dir / "control" / "exit_code").write_text("0\n")
+
+    class _RaceStudy(_StudyStub):
+        def ask(self) -> _TrialStub:
+            trial = _ExitCodeAfterReportTrial(number=len(self.asked))
+            trial.should_prune_returns = True
+            self.asked.append(trial)
+            return trial
+
+    study = _RaceStudy()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    config = SweepConfig(
+        name="lora-optuna-exit-code-after-report",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        strategy={
+            "type": "optuna",
+            "num_trials": 1,
+            "sampler": "random",
+            "pruner": {"type": "median", "n_startup_trials": 0, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert len(study.tells) == 1
+    trial, value, state = study.tells[0]
+    assert trial.number == 0
+    assert trial.reports == [(0.5, 1)]
+    assert value == 0.5
+    assert state is None
+
+    run_dir = _FakePopen.instances[0].run_dirs[0]
+    assert not (run_dir / "control" / "evicted.txt").exists()
+    status = json.loads((run_dir / "status.json").read_text())
+    assert status["state"] == "completed"
+    assert status["objective"] == 0.5
 
 
 def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
@@ -315,6 +514,12 @@ def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
         runs_idx = invocation.command.index("--runs-dir")
         run_dirs = invocation.command[runs_idx + 1].split(":")
         assert len(run_dirs) == 2
+    for run_dir in _FakePopen.instances[0].run_dirs:
+        evicted = run_dir / "control" / "evicted.txt"
+        assert evicted.exists()
+        assert "current Optuna wave" in evicted.read_text()
+    for run_dir in _FakePopen.instances[1].run_dirs:
+        assert not (run_dir / "control" / "evicted.txt").exists()
 
     assert len(study.asked) == 4
     assert len(study.tells) == 4
@@ -322,3 +527,299 @@ def test_multi_run_optuna_runs_in_waves(tmp_path: Path, monkeypatch) -> None:
     for _trial, value, state in study.tells:
         assert state is None
         assert value == 0.5
+
+
+def test_multi_run_optuna_writes_summary_before_halting_on_wave_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+    _FakePopen.failed_trial_indices = {1}
+
+    config = SweepConfig(
+        name="lora-optuna-wave-failure",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 4, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        retry_budget=0,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert len(_FakePopen.instances) == 1
+    assert len(study.asked) == 2
+    assert len(study.tells) == 2
+
+    tell_by_number = {trial.number: (value, state) for trial, value, state in study.tells}
+    assert tell_by_number[0] == (0.5, None)
+    assert tell_by_number[1] == (None, optuna.trial.TrialState.FAIL)
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 1
+    assert manifest["summary"]["best_value"] == 0.5
+    states_by_index = {
+        int(variant["id"].split("-", 1)[0]): json.loads(Path(variant["status_path"]).read_text())["state"]
+        for variant in manifest["variants"]
+    }
+    assert states_by_index == {0: "completed", 1: "failed"}
+
+
+def test_multi_run_optuna_marks_wave_failed_on_launcher_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    def fake_popen(command, **kwargs):
+        if command and command[0] == "rl-multi-run":
+            raise FileNotFoundError("missing rl-multi-run")
+        assert _FakePopen._real_popen is not None
+        return _FakePopen._real_popen(command, **kwargs)
+
+    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", fake_popen)
+
+    config = SweepConfig(
+        name="lora-optuna-launch-failure",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 2, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert len(_FakePopen.instances) == 0
+    assert len(study.asked) == 2
+    assert [state for _trial, _value, state in study.tells] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.FAIL,
+    ]
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 0
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "failed"
+        assert status["returncode"] == -1
+        assert status["failure_stage"] == "launch"
+        assert "FileNotFoundError" in status["error"]
+
+
+def test_multi_run_optuna_retries_launcher_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    launch_attempts = 0
+
+    def fake_popen(command, **kwargs):
+        nonlocal launch_attempts
+        if command and command[0] == "rl-multi-run":
+            launch_attempts += 1
+            if launch_attempts == 1:
+                raise FileNotFoundError("temporary rl-multi-run miss")
+            return _FakePopen(command, **kwargs)
+        assert _FakePopen._real_popen is not None
+        return _FakePopen._real_popen(command, **kwargs)
+
+    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", fake_popen)
+
+    config = SweepConfig(
+        name="lora-optuna-launch-retry",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 2, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        retry_budget=1,
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert launch_attempts == 2
+    assert len(_FakePopen.instances) == 1
+    assert len(study.asked) == 2
+    assert len(study.tells) == 2
+    for _trial, value, state in study.tells:
+        assert value == 0.5
+        assert state is None
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 2
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "completed"
+        assert status["returncode"] == 0
+        assert status["attempts"] == 2
+        assert "failure_stage" not in status
+
+
+def test_multi_run_optuna_marks_missing_objectives_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    config = SweepConfig(
+        name="lora-optuna-missing-objective",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        strategy={
+            "type": "optuna",
+            "num_trials": 2,
+            "sampler": "random",
+            "seed": 7,
+            "pruner": {"type": "median", "n_startup_trials": 1, "n_warmup_steps": 0},
+            "poll_interval_seconds": 0.01,
+        },
+        parameters={"orchestrator.optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "missing", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+    assert exc_info.value.code == 1
+
+    assert len(study.tells) == 2
+    assert [state for _trial, _value, state in study.tells] == [optuna.trial.TrialState.FAIL] * 2
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 0
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "failed"
+        assert status["returncode"] == 0
+        assert status["failure_stage"] == "objective"
+        assert status["objective"] is None
+
+
+def test_multi_run_optuna_does_not_launch_partial_wave_after_materialization_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    study = _StudyStub()
+    _install_fake_optuna_runtime(monkeypatch, study)
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    original_materialize = multi_run_mod.materialize_multi_run_trial
+    calls = {"n": 0}
+
+    def flaky_materialize(config, trial, scheduler):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("fake materialization failure")
+        return original_materialize(config, trial, scheduler)
+
+    monkeypatch.setattr(multi_run_mod, "materialize_multi_run_trial", flaky_materialize)
+
+    config = SweepConfig(
+        name="lora-optuna-materialization-failure",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 3,
+            "shared": [shared_path],
+        },
+        strategy={"type": "optuna", "num_trials": 3, "sampler": "random"},
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert len(_FakePopen.instances) == 0
+    assert len(study.asked) == 2
+
+    tell_by_number = {trial.number: state for trial, _value, state in study.tells}
+    assert tell_by_number == {
+        0: optuna.trial.TrialState.FAIL,
+        1: optuna.trial.TrialState.FAIL,
+    }
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 0
+    assert len(manifest["variants"]) == 2
+    statuses_by_index = {
+        int(variant["id"].split("-", 1)[0]): json.loads(Path(variant["status_path"]).read_text())
+        for variant in manifest["variants"]
+    }
+    assert statuses_by_index[0]["state"] == "failed"
+    assert statuses_by_index[0]["returncode"] == -1
+    assert statuses_by_index[0]["failure_stage"] == "scheduler"
+    assert "not launched" in statuses_by_index[0]["error"]
+    assert statuses_by_index[1]["state"] == "failed"
+    assert statuses_by_index[1]["returncode"] == -1
+    assert statuses_by_index[1]["failure_stage"] == "materialization"
+    assert "fake materialization failure" in statuses_by_index[1]["error"]

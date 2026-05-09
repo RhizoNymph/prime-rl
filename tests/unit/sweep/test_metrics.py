@@ -57,6 +57,11 @@ def test_read_final_summary_rejects_non_finite(tmp_path: Path) -> None:
     assert read_final_summary(tmp_path, "ok") == 1.5
 
 
+def test_read_final_summary_rejects_integer_float_overflow(tmp_path: Path) -> None:
+    write_summary(tmp_path / "run-x" / "final_summary.json", {"reward": 10**1000})
+    assert read_final_summary(tmp_path, "reward") is None
+
+
 def test_read_final_summary_reads_latest_step_from_metrics_jsonl(tmp_path: Path) -> None:
     """metrics.jsonl is the canonical source: take the value at the largest step."""
     write_metrics_jsonl(
@@ -68,6 +73,17 @@ def test_read_final_summary_reads_latest_step_from_metrics_jsonl(tmp_path: Path)
         ],
     )
     assert read_final_summary(tmp_path, "reward") == 0.3
+
+
+def test_read_final_summary_uses_later_row_when_steps_tie(tmp_path: Path) -> None:
+    write_metrics_jsonl(
+        tmp_path,
+        [
+            {"step": 2, "reward": 0.2},
+            {"step": 2, "reward": 0.6},
+        ],
+    )
+    assert read_final_summary(tmp_path, "reward") == 0.6
 
 
 def test_read_final_summary_prefers_metrics_jsonl_over_legacy(tmp_path: Path) -> None:
@@ -95,6 +111,48 @@ def test_read_final_summary_skips_malformed_jsonl_lines(tmp_path: Path) -> None:
     assert read_final_summary(tmp_path, "reward") == 0.5
 
 
+def test_read_final_summary_returns_none_for_malformed_legacy_summary(tmp_path: Path) -> None:
+    summary_path = tmp_path / "run-x" / "final_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text("{not valid json\n")
+    assert read_final_summary(tmp_path, "reward") is None
+
+    summary_path.write_text(json.dumps(["not", "a", "mapping"]))
+    assert read_final_summary(tmp_path, "reward") is None
+
+
+def test_read_final_summary_ignores_malformed_step_for_ordering(tmp_path: Path) -> None:
+    write_metrics_jsonl(
+        tmp_path,
+        [
+            {"step": 1, "reward": 0.1},
+            {"step": "2", "reward": 0.9},
+            {"step": 3, "reward": 0.5},
+        ],
+    )
+    assert read_final_summary(tmp_path, "reward") == 0.5
+
+
+def test_read_final_summary_ignores_rows_with_invalid_steps(tmp_path: Path) -> None:
+    write_metrics_jsonl(
+        tmp_path,
+        [
+            {"step": "5", "reward": 0.9},
+            {"step": True, "reward": 0.8},
+            {"step": -1, "reward": 0.7},
+        ],
+    )
+
+    assert read_final_summary(tmp_path, "reward") is None
+
+
+def test_read_final_summary_falls_back_when_sidecar_steps_invalid(tmp_path: Path) -> None:
+    write_metrics_jsonl(tmp_path, [{"step": -1, "reward": 0.9}])
+    write_summary(tmp_path / "run-x" / "final_summary.json", {"reward": 0.4})
+
+    assert read_final_summary(tmp_path, "reward") == 0.4
+
+
 def test_read_intermediate_metric_returns_none_when_missing(tmp_path: Path) -> None:
     assert read_intermediate_metric(tmp_path, "reward") is None
     write_metrics_jsonl(tmp_path, [{"step": 1, "loss": 1.5}])
@@ -112,6 +170,17 @@ def test_read_intermediate_metric_returns_latest_step_value(tmp_path: Path) -> N
         ],
     )
     assert read_intermediate_metric(tmp_path, "reward") == (5, 0.7)
+
+
+def test_read_intermediate_metric_uses_later_row_when_steps_tie(tmp_path: Path) -> None:
+    write_metrics_jsonl(
+        tmp_path,
+        [
+            {"step": 2, "reward": 0.2},
+            {"step": 2, "reward": 0.6},
+        ],
+    )
+    assert read_intermediate_metric(tmp_path, "reward") == (2, 0.6)
 
 
 def test_read_intermediate_metric_rejects_non_finite_values(tmp_path: Path) -> None:
@@ -134,3 +203,20 @@ def test_read_intermediate_metric_skips_malformed_lines(tmp_path: Path) -> None:
         + "\n"  # blank line
     )
     assert read_intermediate_metric(tmp_path, "reward") == (2, 0.5)
+
+
+def test_read_intermediate_metric_ignores_malformed_step_for_ordering(tmp_path: Path) -> None:
+    write_metrics_jsonl(
+        tmp_path,
+        [
+            {"step": "5", "reward": 0.9},
+            {"step": 4, "reward": 0.7},
+        ],
+    )
+    assert read_intermediate_metric(tmp_path, "reward") == (4, 0.7)
+
+
+def test_read_intermediate_metric_rejects_negative_step(tmp_path: Path) -> None:
+    write_metrics_jsonl(tmp_path, [{"step": -1, "reward": 0.9}])
+
+    assert read_intermediate_metric(tmp_path, "reward") is None

@@ -15,6 +15,7 @@ master rank writes to avoid interleaved lines from different ranks.
 
 import json
 import math
+import operator
 import os
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,9 @@ from prime_rl.utils.monitor.base import Monitor
 def _coerce_finite(value: Any) -> Any:
     """Replace non-finite floats with None so JSONL stays parseable.
 
-    json.dumps writes NaN/Infinity as non-standard tokens and standard
-    json.loads then chokes on them; the sweep reader treats None as a
-    missing value, which matches its existing behavior for absent keys.
+    json.dumps writes NaN/Infinity as non-standard tokens; the sweep reader
+    treats None as a missing value, which matches its existing behavior for
+    absent keys and keeps the sidecar consumable by strict JSON readers.
     """
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -38,11 +39,27 @@ def _coerce_finite(value: Any) -> Any:
         return {k: _coerce_finite(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_coerce_finite(v) for v in value]
+    if isinstance(value, tuple):
+        return [_coerce_finite(v) for v in value]
+    return value
+
+
+def _coerce_step(step: int) -> int:
+    if isinstance(step, bool):
+        raise TypeError("FileMonitor step must be an integer, not bool")
+    try:
+        value = operator.index(step)
+    except TypeError as exc:
+        raise TypeError("FileMonitor step must be an integer") from exc
+    if value < 0:
+        raise ValueError("FileMonitor step must be non-negative")
     return value
 
 
 class FileMonitor(Monitor):
     """Append step-indexed metrics to ``output_path`` as one JSON line per call."""
+
+    required: bool = True
 
     def __init__(self, output_path: Path, keep_full_history: bool = True):
         self.output_path = Path(output_path)
@@ -60,13 +77,14 @@ class FileMonitor(Monitor):
             self._file = None
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
+        step = _coerce_step(step)
         if self._keep_full_history:
             self.history.append(metrics)
         else:
             self.history = [metrics]
         if self._file is None:
             return
-        record = {"step": int(step), **_coerce_finite(metrics)}
+        record = {**_coerce_finite(metrics), "step": step}
         self._file.write(json.dumps(record) + "\n")
         self._file.flush()
 

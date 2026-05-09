@@ -10,8 +10,10 @@ objective recording from each run's metrics.jsonl sidecar.
 
 import json
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
+import pytest
 import tomli
 import tomli_w
 
@@ -128,6 +130,226 @@ def test_multi_run_lora_sweep_end_to_end(tmp_path: Path, monkeypatch) -> None:
     assert sorted(objectives) == [0.3, 0.4, 0.7]
 
 
+def test_multi_run_lora_counts_clean_exit_without_objective_as_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    config = SweepConfig(
+        name="lora-missing-objective",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        idx = command.index("--runs-dir")
+        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
+        for run_dir in run_dirs:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "metrics.jsonl").write_text(json.dumps({"step": 1, "other": 0.5}) + "\n")
+            (run_dir / "control").mkdir(parents=True, exist_ok=True)
+            (run_dir / "control" / "exit_code").write_text("0\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest["summary"]["completed"] == 0
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "failed"
+        assert status["failure_stage"] == "objective"
+        assert status["objective"] is None
+
+
+def test_static_multi_run_lora_records_materialization_failure_and_launches_valid_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    import prime_rl.sweep.controller as controller_mod
+
+    original_materialize = controller_mod.materialize_multi_run_trial
+
+    def flaky_materialize(config, trial, scheduler):
+        if trial.parameters["orchestrator.optim.lr"] == 3e-5:
+            raise ValueError("fake materialization failure")
+        return original_materialize(config, trial, scheduler)
+
+    launched_parameters = []
+
+    def fake_submit(artifacts, **kwargs):
+        launched_parameters.extend(artifact.trial.parameters for artifact in artifacts)
+        return 0
+
+    monkeypatch.setattr(controller_mod, "materialize_multi_run_trial", flaky_materialize)
+    monkeypatch.setattr(controller_mod, "submit_trials_to_multi_run_lora", fake_submit)
+
+    config = SweepConfig(
+        name="lora-materialization-failure",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 3,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert launched_parameters == [
+        {"orchestrator.optim.lr": 1e-5},
+        {"orchestrator.optim.lr": 1e-4},
+    ]
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    statuses_by_index = {
+        int(variant["id"].split("-", 1)[0]): json.loads(Path(variant["status_path"]).read_text())
+        for variant in manifest["variants"]
+    }
+    assert len(statuses_by_index) == 3
+    assert statuses_by_index[0]["state"] == "pending"
+    assert statuses_by_index[1]["state"] == "failed"
+    assert statuses_by_index[1]["failure_stage"] == "materialization"
+    assert "fake materialization failure" in statuses_by_index[1]["error"]
+    assert statuses_by_index[2]["state"] == "pending"
+
+
+def test_static_multi_run_lora_does_not_launch_after_materialization_failure_when_continue_false(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    import prime_rl.sweep.controller as controller_mod
+
+    original_materialize = controller_mod.materialize_multi_run_trial
+
+    def flaky_materialize(config, trial, scheduler):
+        if trial.parameters["orchestrator.optim.lr"] == 3e-5:
+            raise ValueError("fake materialization failure")
+        return original_materialize(config, trial, scheduler)
+
+    def fake_submit(*args, **kwargs):
+        raise AssertionError("continue_on_failure=false should not launch after materialization failure")
+
+    monkeypatch.setattr(controller_mod, "materialize_multi_run_trial", flaky_materialize)
+    monkeypatch.setattr(controller_mod, "submit_trials_to_multi_run_lora", fake_submit)
+
+    config = SweepConfig(
+        name="lora-materialization-fail-fast",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 3,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+        continue_on_failure=False,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert "Skipping multi_run_lora launch: materialization failed" in capsys.readouterr().out
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert [variant["overrides"] for variant in manifest["variants"]] == [
+        {"orchestrator.optim.lr": 1e-5},
+        {"orchestrator.optim.lr": 3e-5},
+    ]
+    statuses = [json.loads(Path(variant["status_path"]).read_text()) for variant in manifest["variants"]]
+    assert [status["state"] for status in statuses] == ["pending", "failed"]
+    assert statuses[1]["failure_stage"] == "materialization"
+
+
+def test_static_multi_run_lora_dry_run_exits_nonzero_on_materialization_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    import prime_rl.sweep.controller as controller_mod
+
+    original_materialize = controller_mod.materialize_multi_run_trial
+
+    def flaky_materialize(config, trial, scheduler):
+        if trial.parameters["orchestrator.optim.lr"] == 3e-5:
+            raise ValueError("fake materialization failure")
+        return original_materialize(config, trial, scheduler)
+
+    def fake_submit(*args, **kwargs):
+        raise AssertionError("dry run should not launch multi_run_lora")
+
+    monkeypatch.setattr(controller_mod, "materialize_multi_run_trial", flaky_materialize)
+    monkeypatch.setattr(controller_mod, "submit_trials_to_multi_run_lora", fake_submit)
+
+    config = SweepConfig(
+        name="lora-materialization-dry-run",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        dry_run=True,
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    assert exc_info.value.code == 1
+    assert "Dry run found 1 failed trial materialization(s)." in capsys.readouterr().out
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    statuses = [json.loads(Path(variant["status_path"]).read_text()) for variant in manifest["variants"]]
+    assert [status["state"] for status in statuses] == ["pending", "failed"]
+    assert statuses[1]["failure_stage"] == "materialization"
+
+
 def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -155,6 +377,7 @@ def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
         },
         parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
         objective={"metric": "reward", "direction": "maximize"},
+        continue_on_failure=False,
         wandb=None,
     )
 
@@ -284,6 +507,8 @@ def test_multi_run_lora_sweep_preserves_pre_marked_pruned_state(
 
     assert states_by_index[0]["state"] == "pruned"
     assert states_by_index[0]["pruned_reason"] == "test prune"
+    assert states_by_index[0]["returncode"] == 1
+    assert "finished_at" in states_by_index[0]
     assert states_by_index[1]["state"] == "completed"
     assert states_by_index[1]["objective"] == 0.6
 
@@ -343,6 +568,177 @@ def test_multi_run_lora_sweep_marks_all_failed_when_exit_codes_missing(
         assert status["returncode"] == 2
 
 
+def test_multi_run_lora_clears_stale_runtime_signals_before_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from prime_rl.sweep.materialize import Trial, TrialArtifacts, write_json
+    from prime_rl.sweep.schedulers import submit_trials_to_multi_run_lora
+
+    run_dir = tmp_path / "study" / "shared" / "run_0000-stale"
+    control_dir = run_dir / "control"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    status_path = run_dir / "status.json"
+    write_json(
+        status_path,
+        {
+            "id": "0000-stale",
+            "label": "stale",
+            "state": "pending",
+            "pid": None,
+            "slurm_job_id": None,
+            "gpu_group": None,
+            "returncode": None,
+            "objective": None,
+        },
+    )
+    (control_dir / "exit_code").write_text("0\n")
+    (control_dir / "evicted.txt").write_text("old prune\n")
+    metrics_path = run_dir / "metrics.jsonl"
+    metrics_path.write_text(json.dumps({"step": 9, "reward": 0.99}) + "\n")
+    stale_summary = run_dir / "run-old" / "final_summary.json"
+    stale_summary.parent.mkdir(parents=True, exist_ok=True)
+    stale_summary.write_text(json.dumps({"reward": 0.99}))
+
+    artifact = TrialArtifacts(
+        trial=Trial(id="0000-stale", label="stale", parameters={}),
+        trial_dir=run_dir,
+        run_dir=run_dir,
+        overrides_path=run_dir / "overrides.toml",
+        resolved_path=run_dir / "resolved.toml",
+        command_path=run_dir / "command.txt",
+        status_path=status_path,
+        command=[],
+        resolved_checksum="",
+        base_checksums={},
+    )
+
+    def fake_run(command, env=None, **kwargs):
+        return SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_multi_run_lora(
+        [artifact], shared_paths=[], shared_dir=tmp_path / "study" / "shared"
+    )
+
+    status = json.loads(status_path.read_text())
+    assert failures == 1
+    assert status["state"] == "failed"
+    assert status["returncode"] == 2
+    assert not (control_dir / "exit_code").exists()
+    assert not (control_dir / "evicted.txt").exists()
+    assert metrics_path.read_text() == ""
+    assert not stale_summary.exists()
+
+
+def test_multi_run_launcher_marks_failed_orchestrators_evicted(tmp_path: Path) -> None:
+    from prime_rl.sweep.run_control import record_finished_orchestrator_exit_codes
+
+    class FinishedProcess:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+        def poll(self) -> int:
+            return self.returncode
+
+    success_dir = tmp_path / "run_success"
+    failed_dir = tmp_path / "run_failed"
+    pruned_dir = tmp_path / "run_pruned"
+    pruned_control_dir = pruned_dir / "control"
+    pruned_control_dir.mkdir(parents=True)
+    (pruned_control_dir / "evicted.txt").write_text("optuna pruned\n")
+
+    recorded_run_dirs: set[Path] = set()
+    record_finished_orchestrator_exit_codes(
+        [FinishedProcess(0), FinishedProcess(2), FinishedProcess(1)],
+        [success_dir, failed_dir, pruned_dir],
+        recorded_run_dirs,
+    )
+
+    assert recorded_run_dirs == {success_dir, failed_dir, pruned_dir}
+    assert (success_dir / "control" / "exit_code").read_text() == "0\n"
+    assert not (success_dir / "control" / "evicted.txt").exists()
+    assert (failed_dir / "control" / "exit_code").read_text() == "2\n"
+    assert (failed_dir / "control" / "evicted.txt").read_text() == "orchestrator exited with code 2\n"
+    assert (pruned_dir / "control" / "exit_code").read_text() == "1\n"
+    assert (pruned_dir / "control" / "evicted.txt").read_text() == "optuna pruned\n"
+
+
+def test_multi_run_launcher_detects_failed_wave_after_all_orchestrators_stop() -> None:
+    from prime_rl.sweep.run_control import finished_orchestrator_failures
+
+    class FinishedProcess:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    stop_events = {"orchestrator-a": Event(), "orchestrator-b": Event()}
+    processes = [FinishedProcess(1), FinishedProcess(0)]
+
+    assert finished_orchestrator_failures(["orchestrator-a", "orchestrator-b"], processes, stop_events) == []
+
+    stop_events["orchestrator-a"].set()
+    assert finished_orchestrator_failures(["orchestrator-a", "orchestrator-b"], processes, stop_events) == []
+
+    stop_events["orchestrator-b"].set()
+    assert finished_orchestrator_failures(["orchestrator-a", "orchestrator-b"], processes, stop_events) == [
+        ("orchestrator-a", 1)
+    ]
+
+
+def test_multi_run_lora_marks_inactive_shared_run_dirs_evicted_before_launch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The trainer scans every shared/run_* dir, so stale dirs must be hidden."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    stale_run_dir = tmp_path / "study" / "shared" / "run_9999-stale"
+    stale_control_dir = stale_run_dir / "control"
+    stale_control_dir.mkdir(parents=True, exist_ok=True)
+    (stale_control_dir / "orch.toml").write_text("# stale\n")
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+
+        assert (stale_control_dir / "evicted.txt").exists()
+        idx = command.index("--runs-dir")
+        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
+        assert len(run_dirs) == 1
+        active_run_dir = run_dirs[0]
+        assert not (active_run_dir / "control" / "evicted.txt").exists()
+        (active_run_dir / "control" / "exit_code").write_text("0\n")
+        (active_run_dir / "metrics.jsonl").write_text(json.dumps({"step": 1, "reward": 0.5}) + "\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    config = SweepConfig(
+        name="lora-stale-shared-dir",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert "not part of the current sweep wave" in (stale_control_dir / "evicted.txt").read_text()
+
+
 def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, capsys) -> None:
     """dry_run materializes the layout but does not invoke rl-multi-run."""
     shared_path = tmp_path / "shared.toml"
@@ -393,3 +789,34 @@ def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, caps
     # Run dirs exist on disk so the user can inspect orch.toml etc.
     assert (tmp_path / "study" / "shared").exists()
     assert sum(1 for p in (tmp_path / "study" / "shared").glob("run_*")) == 2
+
+
+def test_multi_run_lora_dry_run_rejects_static_search_above_concurrency(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """dry_run should fail the same static wave-size validation as a real run."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    config = SweepConfig(
+        name="lora-dry-too-many",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 1,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        wandb=None,
+        dry_run=True,
+    )
+
+    with pytest.raises(SystemExit, match="max_concurrent_runs=1"):
+        run_sweep(config)
+
+    shared_dir = tmp_path / "study" / "shared"
+    assert not shared_dir.exists() or list(shared_dir.glob("run_*")) == []

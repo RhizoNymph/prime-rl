@@ -22,6 +22,7 @@ files referenced via ``--runs-dir`` produce orchestrators.
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from prime_rl.configs.rl import RLConfig
@@ -33,7 +34,6 @@ from prime_rl.entrypoints.launch import (
     start_orchestrator,
     start_trainer,
     tail_trainer_log,
-    wait_for_completion,
 )
 from prime_rl.entrypoints.rl import (
     INFERENCE_TOML,
@@ -44,6 +44,11 @@ from prime_rl.entrypoints.rl import (
     write_subconfigs,
 )
 from prime_rl.entrypoints.rl_multi_run_args import RUNS_DIR_FLAG, parse_runs_dirs
+from prime_rl.sweep.run_control import (
+    finished_orchestrator_failures,
+    record_finished_orchestrator_exit_codes,
+    record_orchestrator_exit_codes,
+)
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
@@ -79,41 +84,6 @@ def _validate_concurrency(config: RLConfig, run_dirs: list[Path]) -> None:
             f"trainer.max_concurrent_runs={max_runs} but {len(run_dirs)} run dirs were passed; "
             "set max_concurrent_runs to at least the number of concurrent trials."
         )
-
-
-EXIT_CODE_FILENAME = "exit_code"
-
-
-def _write_orchestrator_exit_code(run_dir: Path, returncode: int | None) -> None:
-    """Write a per-orchestrator returncode for the sweep controller to reconcile.
-
-    The sweep controller reads each ``<run_dir>/control/exit_code`` after the
-    multi-run invocation exits, so it can attribute failures to the actual
-    orchestrator that crashed instead of marking every trial in the wave
-    failed (the Phase 7a behavior). ``None`` means "the launcher tore down the
-    orchestrator before it produced an exit code"; we record ``-1`` so the
-    controller treats it as an infrastructure failure.
-    """
-    control_dir = run_dir / "control"
-    control_dir.mkdir(parents=True, exist_ok=True)
-    code = -1 if returncode is None else int(returncode)
-    (control_dir / EXIT_CODE_FILENAME).write_text(f"{code}\n")
-
-
-def _record_orchestrator_exit_codes(
-    orchestrator_processes, run_dirs: list[Path]
-) -> None:
-    """Best-effort: write exit_code for every run dir, swallowing per-run write errors.
-
-    A failure to write one exit_code must not prevent the others from being
-    recorded — the controller falls back to "infrastructure failure" when the
-    file is missing, which is at least diagnosable.
-    """
-    for proc, run_dir in zip(orchestrator_processes, run_dirs):
-        try:
-            _write_orchestrator_exit_code(run_dir, proc.returncode)
-        except OSError:
-            continue
 
 
 def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
@@ -155,12 +125,13 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
 
     orchestrator_labels: list[str] = []
     orchestrator_processes = []
+    recorded_exit_code_dirs: set[Path] = set()
 
     def sigterm_handler(signum, frame):
         logger.warning("Received SIGTERM, terminating all processes...")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
-        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+        record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, sigterm_handler)
@@ -228,15 +199,64 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         logger.success("Startup complete. Showing trainer logs...")
         tail_trainer_log(supervisor, log_dir / "trainer.log")
 
-        # Trainer winding down implies all orchestrators completed; the
-        # supervisor still requires every orchestrator's stop_event to fire,
-        # which they do as their subprocesses exit.
-        wait_for_completion(orchestrator_labels + ["trainer"], supervisor)
+        # Wait for every orchestrator + the trainer. Unlike single-run, we
+        # cannot fail-fast on the first non-zero exit: a pruned or failed
+        # orchestrator (Optuna writes evicted.txt, the orchestrator raises)
+        # is expected, and the trainer's MultiRunManager keeps driving
+        # surviving runs. The sweep controller attributes failure per-run
+        # via each control/exit_code file, so we just wait for everything
+        # to finish and let the post-wait code report status.
+        #
+        # Trainer / inference / teacher_inference crashes are still
+        # terminal — survivors would block forever (trainer waiting for
+        # batches, orchestrators waiting for weights), so we tear the wave
+        # down and exit non-zero, but only after recording per-run exit
+        # codes so the controller can attribute failures correctly.
+        primary_label_set = {*orchestrator_labels, "trainer"}
+        infra_labels = [label for label in supervisor.stop_events if label not in primary_label_set]
+        all_labels = orchestrator_labels + ["trainer"]
+
+        def _terminate_with_exit_codes(reason: str) -> None:
+            logger.error(f"{reason}; tearing down remaining processes")
+            record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+            cleanup_threads(supervisor.monitor_threads)
+            cleanup_processes(supervisor.processes)
+            sys.exit(1)
+
+        while not all(supervisor.stop_events[label].is_set() for label in all_labels):
+            record_finished_orchestrator_exit_codes(
+                orchestrator_processes,
+                run_dirs,
+                recorded_exit_code_dirs,
+            )
+            failed_finished_orchestrators = finished_orchestrator_failures(
+                orchestrator_labels,
+                orchestrator_processes,
+                supervisor.stop_events,
+            )
+            if failed_finished_orchestrators:
+                _terminate_with_exit_codes(
+                    "All orchestrators have exited and at least one failed or was pruned: "
+                    f"{failed_finished_orchestrators}"
+                )
+            # An infra subprocess (inference / teacher_inference) is meant
+            # to run for the whole wave; if its stop_event fires here, it
+            # exited unexpectedly and the trainer/orchestrators will hang.
+            failed_infra = [label for label in infra_labels if supervisor.stop_events[label].is_set()]
+            if failed_infra:
+                _terminate_with_exit_codes(
+                    f"Infrastructure process(es) exited unexpectedly: {failed_infra}"
+                )
+            if supervisor.stop_events["trainer"].is_set() and trainer_process.returncode != 0:
+                _terminate_with_exit_codes(
+                    f"Trainer failed with exit code {trainer_process.returncode}"
+                )
+            time.sleep(1)
 
         # Per-orchestrator exit_code is the sweep controller's source of
         # truth for failure attribution; write it as soon as we've waited
         # for every orchestrator, before any cleanup that might mask codes.
-        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+        record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
 
         failed_orchestrators = [
             (label, proc.returncode)
@@ -264,13 +284,13 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         logger.warning("Received interrupt signal, terminating all processes...")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
-        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+        record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         sys.exit(1)
     except Exception as e:
         logger.error(f"Error occurred: {e}")
         cleanup_threads(supervisor.monitor_threads)
         cleanup_processes(supervisor.processes)
-        _record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
+        record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         raise
 
 
