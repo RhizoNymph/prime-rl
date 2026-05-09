@@ -25,12 +25,14 @@ from prime_rl.sweep.materialize import (
     record_trial_objective,
 )
 from prime_rl.sweep.metrics import read_final_summary
-from prime_rl.sweep.multi_run import run_multi_run_optuna_sweep
+from prime_rl.sweep.multi_run import (
+    run_multi_run_optuna_sweep,
+    run_multi_run_static_continuous_sweep,
+)
 from prime_rl.sweep.optuna_loop import run_optuna_sweep
 from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import (
     run_trials_locally,
-    submit_trials_to_multi_run_lora,
     submit_trials_to_slurm,
 )
 from prime_rl.sweep.search import expand_grid, sample_random
@@ -228,10 +230,12 @@ def _run_optuna(config: SweepConfig) -> None:
 def _run_multi_run_static(config: SweepConfig) -> None:
     """Drive a static (grid/random) shared-trainer LoRA sweep through ``rl-multi-run``.
 
-    On ``--resume``, trials whose prior status was completed/pruned/failed are
-    kept verbatim — Optuna already heard about them (or, for static, they're
-    already in the manifest summary). Only ``state == "pending"`` artifacts go
-    into the next ``rl-multi-run`` invocation.
+    Phase 7e: continuous-flow replaces the wave path. Trials are
+    pre-materialized; the driver maintains ``max_concurrent_runs`` live
+    trials and pulls the next pending artifact off the queue as each slot
+    frees. On ``--resume``, trials whose prior status was
+    completed/pruned/failed are kept verbatim and only contribute to the
+    tracker; only ``state == "pending"`` artifacts go into the launcher.
     """
     assert isinstance(config.scheduler, MultiRunLoRASchedulerConfig)
     artifacts = _materialize_multi_run_study(config)
@@ -245,58 +249,21 @@ def _run_multi_run_static(config: SweepConfig) -> None:
             print(f"  {artifact.run_dir}")
         return
 
-    pending = [
-        artifact
-        for artifact in artifacts
-        if json.loads(artifact.status_path.read_text()).get("state") == "pending"
-    ]
+    failures, tracker = run_multi_run_static_continuous_sweep(
+        config,
+        artifacts,
+        write_manifest_with_variants=write_manifest_with_variants,
+        build_variant=build_variant,
+    )
 
-    if len(pending) > config.scheduler.max_concurrent_runs:
-        raise SystemExit(
-            f"multi_run_lora scheduler.max_concurrent_runs={config.scheduler.max_concurrent_runs} "
-            f"but {len(pending)} trial(s) need to launch. Increase max_concurrent_runs or shrink "
-            "the search space; wave-based execution requires Optuna (Phase 7b)."
-        )
-
-    if pending:
-        failures = submit_trials_to_multi_run_lora(
-            pending,
-            shared_paths=config.scheduler.shared,
-            shared_dir=multi_run_shared_dir(config),
-            continue_on_failure=config.continue_on_failure,
-        )
-    else:
-        failures = 0
-        if config.resume:
-            print(f"Resume: every trial already terminal, no new work to launch.")
-
-    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
-    if config.objective is not None and tracker is not None:
-        for artifact in artifacts:
-            # reconcile_multi_run_artifact already chose between completed /
-            # failed / pruned; only completed trials have an objective worth
-            # rereading from metrics.jsonl, but record_trial_objective(None)
-            # for the others keeps status.json's shape consistent.
-            status = json.loads(artifact.status_path.read_text())
-            if status.get("state") == "completed":
-                # Preserved completed trials carry their authoritative
-                # objective in status.json from the prior run; reuse it
-                # rather than re-reading metrics.jsonl in case the sidecar
-                # was archived between runs.
-                objective = status.get("objective")
-                if objective is None:
-                    objective = read_final_summary(artifact.run_dir, config.objective.metric)
-            else:
-                objective = None
-            record_trial_objective(artifact.status_path, objective)
-            tracker.observe(
-                TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
-            )
+    if tracker is not None:
         summary = asdict(tracker.summary())
         _update_manifest_summary(config, summary)
         if summary["best_trial_id"] is not None:
             label = tracker.best_label or summary["best_trial_id"]
             print(f"Best trial: {label} ({summary['best_value']})")
+        if summary["halted_by_early_stopping"]:
+            print(f"Sweep halted by early stopping ({summary['halt_reason']}).")
 
     if failures > 0:
         print(f"Sweep finished with {failures} failed trial(s) out of {len(artifacts)}.")

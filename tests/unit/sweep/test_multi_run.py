@@ -3,9 +3,15 @@
 The full sweep -> rl-multi-run -> trainer/inference/orchestrator stack
 requires GPUs and a model; here we monkeypatch the parts that need real
 infra (``validate_target_config`` for the resolved orchestrator config,
-``subprocess.run`` for the rl-multi-run invocation) and assert on the
+``subprocess.Popen`` for the rl-multi-run invocation via the shared
+``fake_multi_run_popen`` fixture in conftest.py) and assert on the
 sweep-side contract: layout on disk, the command shape, and per-trial
 objective recording from each run's metrics.jsonl sidecar.
+
+Phase 7e: static (grid/random) sweeps run through the same continuous-flow
+loop as Optuna sweeps. The launcher invocation gains ``--watch-slots`` and
+the controller writes ``<shared_dir>/control/done`` once every trial has
+been settled.
 """
 
 import json
@@ -44,14 +50,16 @@ def _stub_validate_target_config(monkeypatch) -> None:
     monkeypatch.setattr(mat_mod, "validate_target_config", fake_validate)
 
 
-def test_multi_run_lora_sweep_end_to_end(tmp_path: Path, monkeypatch) -> None:
+def test_multi_run_lora_sweep_end_to_end(tmp_path: Path, monkeypatch, fake_multi_run_popen) -> None:
     """A grid over orchestrator.optim.lr produces N run dirs, invokes
-    rl-multi-run once, and records per-trial objectives from each run's
-    metrics.jsonl."""
+    rl-multi-run once with --watch-slots, and records per-trial objectives
+    from each run's metrics.jsonl."""
     shared_path = tmp_path / "shared.toml"
     write_toml(shared_path, {})
 
     _stub_validate_target_config(monkeypatch)
+
+    fake_multi_run_popen.rewards_by_index = {0: 0.4, 1: 0.7, 2: 0.3}
 
     config = SweepConfig(
         name="lora-sweep",
@@ -68,47 +76,18 @@ def test_multi_run_lora_sweep_end_to_end(tmp_path: Path, monkeypatch) -> None:
         wandb=None,
     )
 
-    # The trial id is index-prefixed and contains a hash, so we look up
-    # rewards by the index parsed out of run_<NNNN>-<hash> at call time.
-    captured: dict = {"commands": []}
-    rewards_by_index = {0: 0.4, 1: 0.7, 2: 0.3}
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        captured["commands"].append(list(command))
-        idx = command.index("--runs-dir")
-        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        for run_dir in run_dirs:
-            # Trial IDs are <NNNN>-<hash>; the leading int is the index.
-            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
-            reward = rewards_by_index[trial_index]
-            run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "metrics.jsonl").write_text(
-                json.dumps({"step": 1, "reward": reward}) + "\n"
-            )
-            # 7b contract: launcher writes per-run exit_code; reconcile reads it.
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            (run_dir / "control" / "exit_code").write_text("0\n")
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
-
     run_sweep(config)
 
-    # Exactly one rl-multi-run command was issued, against the three run dirs.
-    assert len(captured["commands"]) == 1
-    cmd = captured["commands"][0]
+    # Single launcher invocation, three initial run dirs, watch-slots enabled.
+    assert len(fake_multi_run_popen.instances) == 1
+    cmd = fake_multi_run_popen.instances[0].command
     assert cmd[0] == "rl-multi-run"
+    assert "--watch-slots" in cmd
     assert "--runs-dir" in cmd
     runs_dir_arg = cmd[cmd.index("--runs-dir") + 1]
-    run_dirs = runs_dir_arg.split(":")
-    assert len(run_dirs) == 3
-    for piece in run_dirs:
+    initial_run_dirs = runs_dir_arg.split(":")
+    assert len(initial_run_dirs) == 3
+    for piece in initial_run_dirs:
         path = Path(piece)
         assert path.exists()
         assert (path / "control" / "orch.toml").exists()
@@ -128,20 +107,78 @@ def test_multi_run_lora_sweep_end_to_end(tmp_path: Path, monkeypatch) -> None:
     assert sorted(objectives) == [0.3, 0.4, 0.7]
 
 
-def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
-    tmp_path: Path, monkeypatch
+def test_multi_run_lora_sweep_streams_when_grid_exceeds_concurrency(
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
 ) -> None:
-    """Phase 7b: per-run ``control/exit_code`` files drive per-trial state.
+    """Phase 7e: grid with 4 trials and max_concurrent_runs=2 streams.
 
-    Mixed exit codes across the wave should produce mixed states — the failed
-    orchestrator's trial is ``failed`` with its own exit code; survivors are
-    ``completed`` with the recovered objective. The aggregate launcher
-    returncode no longer overrides per-run state.
+    Pre-7e this combination was rejected with ``num_trials > max_concurrent_runs``.
+    Continuous-flow lifts that: the controller materializes only 2 initial run
+    dirs in the launcher's --runs-dir, then drops the next trial's status into
+    place as each slot frees and the launcher's slot-watch loop spawns the
+    new orchestrator.
     """
     shared_path = tmp_path / "shared.toml"
     write_toml(shared_path, {})
 
     _stub_validate_target_config(monkeypatch)
+
+    fake_multi_run_popen.rewards_by_index = {0: 0.1, 1: 0.4, 2: 0.7, 3: 0.3}
+
+    config = SweepConfig(
+        name="lora-streaming",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4, 5e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    assert len(fake_multi_run_popen.instances) == 1
+    cmd = fake_multi_run_popen.instances[0].command
+    runs_dir_arg = cmd[cmd.index("--runs-dir") + 1]
+    initial_run_dirs = runs_dir_arg.split(":")
+    assert len(initial_run_dirs) == 2  # initial cohort sized to max_concurrent_runs
+    assert "--watch-slots" in cmd
+
+    # Done marker written so the launcher tears down.
+    shared_dir = tmp_path / "study" / "shared"
+    assert (shared_dir / "control" / "done").exists()
+
+    # All 4 trials materialized.
+    materialized = sorted(p.name for p in shared_dir.glob("run_*"))
+    assert len(materialized) == 4
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    summary = manifest["summary"]
+    assert summary["completed"] == 4
+    assert summary["best_value"] == 0.7
+
+
+def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
+) -> None:
+    """Phase 7b/7e: per-run ``control/exit_code`` files drive per-trial state.
+
+    Mixed exit codes across the cohort produce mixed states — the failed
+    orchestrator's trial is ``failed`` with its own exit code; survivors are
+    ``completed`` with the recovered objective.
+    """
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    fake_multi_run_popen.exit_codes_by_index = {0: 0, 1: 1, 2: 0}
+    fake_multi_run_popen.rewards_by_index = {0: 0.4, 2: 0.3}
 
     config = SweepConfig(
         name="lora-mixed",
@@ -155,36 +192,9 @@ def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
         },
         parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
         objective={"metric": "reward", "direction": "maximize"},
+        retry_budget=0,  # disable auto-retry so the failure surfaces directly
         wandb=None,
     )
-
-    # exit_code 1 for the middle trial; rewards only recorded for survivors.
-    exit_codes_by_index = {0: 0, 1: 1, 2: 0}
-    rewards_by_index = {0: 0.4, 2: 0.3}
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        idx = command.index("--runs-dir")
-        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        for run_dir in run_dirs:
-            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            code = exit_codes_by_index[trial_index]
-            (run_dir / "control" / "exit_code").write_text(f"{code}\n")
-            if code == 0 and trial_index in rewards_by_index:
-                run_dir.mkdir(parents=True, exist_ok=True)
-                (run_dir / "metrics.jsonl").write_text(
-                    json.dumps({"step": 1, "reward": rewards_by_index[trial_index]}) + "\n"
-                )
-        # Aggregate non-zero so the controller's failure-counting branch fires.
-        return SimpleNamespace(returncode=1)
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
 
     try:
         run_sweep(config)
@@ -207,25 +217,25 @@ def test_multi_run_lora_sweep_attributes_failures_per_orchestrator(
     assert states_by_index[2]["state"] == "completed"
     assert states_by_index[2]["objective"] == 0.3
 
-    # Manifest summary picks the best across only the completed trials.
     summary = manifest["summary"]
     assert summary["completed"] == 2
     assert summary["best_value"] == 0.4
 
 
-def test_multi_run_lora_sweep_preserves_pre_marked_pruned_state(
-    tmp_path: Path, monkeypatch
+def test_multi_run_lora_static_fail_fast_writes_done_before_wait(
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
 ) -> None:
-    """If status.json already shows ``pruned`` (controller pre-marked it
-    before writing evicted.txt), the orchestrator's inevitable non-zero exit
-    must not flip it back to ``failed``."""
+    """Static continuous-flow fail-fast exits still signal the launcher."""
     shared_path = tmp_path / "shared.toml"
     write_toml(shared_path, {})
 
     _stub_validate_target_config(monkeypatch)
 
+    fake_multi_run_popen.exit_codes_by_index = {0: 1}
+    fake_multi_run_popen.assert_done_on_wait = True
+
     config = SweepConfig(
-        name="lora-pruned",
+        name="lora-static-fail-fast",
         entrypoint="rl",
         base=[shared_path],
         output_dir=tmp_path / "study",
@@ -236,96 +246,8 @@ def test_multi_run_lora_sweep_preserves_pre_marked_pruned_state(
         },
         parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
         objective={"metric": "reward", "direction": "maximize"},
-        wandb=None,
-    )
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        idx = command.index("--runs-dir")
-        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        # The "pruned" trial is index 0 — its status.json was pre-marked
-        # by the controller, then the orchestrator exited non-zero.
-        for trial_index, run_dir in enumerate(run_dirs):
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            if trial_index == 0:
-                status_path = run_dir / "status.json"
-                status = json.loads(status_path.read_text())
-                status["state"] = "pruned"
-                status["pruned_reason"] = "test prune"
-                status["pruned_at_step"] = 1
-                status["pruned_value"] = 0.05
-                status["objective"] = None
-                status_path.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
-                (run_dir / "control" / "exit_code").write_text("1\n")
-            else:
-                (run_dir / "control" / "exit_code").write_text("0\n")
-                run_dir.mkdir(parents=True, exist_ok=True)
-                (run_dir / "metrics.jsonl").write_text(
-                    json.dumps({"step": 1, "reward": 0.6}) + "\n"
-                )
-        return SimpleNamespace(returncode=1)
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
-
-    # The pruned trial doesn't count as a failure, so the surviving trial
-    # carries the sweep — no SystemExit since failures==0.
-    run_sweep(config)
-
-    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
-    states_by_index: dict[int, dict] = {}
-    for variant in manifest["variants"]:
-        trial_idx = int(variant["id"].split("-", 1)[0])
-        states_by_index[trial_idx] = json.loads(Path(variant["status_path"]).read_text())
-
-    assert states_by_index[0]["state"] == "pruned"
-    assert states_by_index[0]["pruned_reason"] == "test prune"
-    assert states_by_index[1]["state"] == "completed"
-    assert states_by_index[1]["objective"] == 0.6
-
-
-def test_multi_run_lora_sweep_marks_all_failed_when_exit_codes_missing(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Launcher death (no per-run exit_code files) is treated as an
-    infrastructure failure: every trial without a recorded exit code is
-    marked failed with the aggregate returncode (or -1 fallback)."""
-    shared_path = tmp_path / "shared.toml"
-    write_toml(shared_path, {})
-
-    _stub_validate_target_config(monkeypatch)
-
-    captured: dict = {"commands": []}
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        captured["commands"].append(list(command))
-        # No exit_code files written — simulates launcher dying before any
-        # orchestrator started.
-        return SimpleNamespace(returncode=2)
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
-
-    config = SweepConfig(
-        name="lora-launcher-died",
-        entrypoint="rl",
-        base=[shared_path],
-        output_dir=tmp_path / "study",
-        scheduler={
-            "type": "multi_run_lora",
-            "max_concurrent_runs": 2,
-            "shared": [shared_path],
-        },
-        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        retry_budget=0,
+        continue_on_failure=False,
         wandb=None,
     )
 
@@ -334,28 +256,25 @@ def test_multi_run_lora_sweep_marks_all_failed_when_exit_codes_missing(
     except SystemExit as exc:
         assert exc.code == 1
     else:
-        raise AssertionError("Expected SystemExit when launcher exited non-zero")
+        raise AssertionError("Expected SystemExit when static fail-fast trial failed")
 
-    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
-    for variant in manifest["variants"]:
-        status = json.loads(Path(variant["status_path"]).read_text())
-        assert status["state"] == "failed"
-        assert status["returncode"] == 2
+    assert (tmp_path / "study" / "shared" / "control" / "done").exists()
+    assert len(fake_multi_run_popen.instances) == 1
 
 
 def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_multi_run_popen
 ) -> None:
     """Phase 7c: ``--resume`` only relaunches trials whose prior status is
-    ``pending`` (or running, treated as pending). Completed/pruned/failed
-    trials keep their preserved artifacts and stay out of the new
-    ``rl-multi-run`` invocation."""
+    pending. Completed/pruned/failed trials keep their preserved artifacts
+    and stay out of the next ``rl-multi-run`` invocation.
+    """
     shared_path = tmp_path / "shared.toml"
     write_toml(shared_path, {})
 
     _stub_validate_target_config(monkeypatch)
 
-    base_config_kwargs = dict(
+    base_kwargs = dict(
         name="lora-resume",
         entrypoint="rl",
         base=[shared_path],
@@ -370,30 +289,8 @@ def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
         wandb=None,
     )
 
-    # Run 1: every trial completes with a different reward.
-    rewards_run_1 = {0: 0.4, 1: 0.7, 2: 0.3}
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run_completed(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        idx = command.index("--runs-dir")
-        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        for run_dir in run_dirs:
-            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
-            run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / "metrics.jsonl").write_text(
-                json.dumps({"step": 1, "reward": rewards_run_1[trial_index]}) + "\n"
-            )
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            (run_dir / "control" / "exit_code").write_text("0\n")
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run_completed)
-    run_sweep(SweepConfig(**base_config_kwargs))
+    fake_multi_run_popen.rewards_by_index = {0: 0.4, 1: 0.7, 2: 0.3}
+    run_sweep(SweepConfig(**base_kwargs))
 
     # Confirm run 1 left every trial completed.
     manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
@@ -401,35 +298,118 @@ def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
         status = json.loads(Path(variant["status_path"]).read_text())
         assert status["state"] == "completed"
 
-    # Run 2 with --resume: simulate every trial as a launcher that, if it
-    # ran, would mark trials with a totally different reward. If resume
-    # works, the launcher is *not* invoked at all because every trial is
-    # already terminal.
-    invoked: list = []
+    # Reset the fake's instance list before resume so we can assert on what
+    # the resume run does (not the prior run's invocation).
+    fake_multi_run_popen.instances = []
 
-    def fake_run_should_not_invoke(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        invoked.append(list(command))
-        # Defensive: if resume skips correctly we never hit this branch.
-        idx = command.index("--runs-dir")
-        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
-        for run_dir in run_dirs:
-            (run_dir / "control").mkdir(parents=True, exist_ok=True)
-            (run_dir / "control" / "exit_code").write_text("0\n")
-        return SimpleNamespace(returncode=0)
+    import os
 
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run_should_not_invoke)
-    run_sweep(SweepConfig(**base_config_kwargs, resume=True))
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    shared_dir = tmp_path / "study" / "shared"
+    (shared_dir / ".launcher.pid").write_text(f"{os.getpid()}\n")
+    (shared_dir / ".launcher.heartbeat").touch()
+    monkeypatch.setattr(multi_run_mod, "_wait_for_pid_exit", lambda *_a, **_kw: None)
+
+    run_sweep(SweepConfig(**base_kwargs, resume=True))
 
     # No rl-multi-run invocation: every trial was already terminal.
-    rl_multi_run_calls = [c for c in invoked if c and c[0] == "rl-multi-run"]
-    assert rl_multi_run_calls == []
+    assert fake_multi_run_popen.instances == []
+    assert (shared_dir / "control" / "done").exists()
 
-    # Manifest summary still reflects run-1 history (best_value is the
-    # winning trial's objective from the original run).
     manifest_after = json.loads((tmp_path / "study" / "manifest.json").read_text())
     assert manifest_after["summary"]["best_value"] == 0.7
+
+
+def test_multi_run_lora_sweep_live_attach_skips_popen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 7e: a fresh ``.launcher.pid`` + heartbeat triggers live-attach.
+
+    The controller skips ``subprocess.Popen`` and instead drops new
+    ``run_*/control/orch.toml`` into the shared dir, relying on the existing
+    launcher's watch-slots loop. The test simulates that loop via the
+    ``time.sleep`` monkeypatch: each tick scans for new run dirs and writes
+    their exit_code (mirroring what the real launcher would do).
+    """
+    import os
+
+    from prime_rl.sweep import multi_run as multi_run_mod
+
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    shared_dir = tmp_path / "study" / "shared"
+    shared_dir.mkdir(parents=True)
+
+    # Pre-write PID + heartbeat so _detect_running_launcher returns the
+    # current test process's PID (which is definitely alive).
+    (shared_dir / ".launcher.pid").write_text(f"{os.getpid()}\n")
+    (shared_dir / ".launcher.heartbeat").touch()
+
+    seen: set[str] = set()
+
+    def simulate_launcher_tick(*_args, **_kwargs):
+        for run_dir in sorted(shared_dir.glob("run_*")):
+            if run_dir.name in seen:
+                continue
+            if not (run_dir / "control" / "orch.toml").exists():
+                continue
+            (run_dir / "metrics.jsonl").write_text(
+                json.dumps({"step": 1, "reward": 0.5}) + "\n"
+            )
+            (run_dir / "control" / "exit_code").write_text("0\n")
+            seen.add(run_dir.name)
+
+    import subprocess as real_subprocess
+
+    real_popen = real_subprocess.Popen
+    rl_popen_calls: list = []
+
+    def selective_popen(command, **kwargs):
+        if command and command[0] == "rl-multi-run":
+            rl_popen_calls.append(list(command))
+            raise AssertionError(
+                f"Popen for rl-multi-run should not be called on live-attach: {command}"
+            )
+        # Non-rl-multi-run commands (git, etc.) use the real Popen.
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(multi_run_mod.time, "sleep", simulate_launcher_tick)
+    monkeypatch.setattr(multi_run_mod.subprocess, "Popen", selective_popen)
+    # The "live launcher" is just os.getpid() — without this patch the
+    # controller would block in _wait_for_pid_exit waiting for the test
+    # process itself to exit.
+    monkeypatch.setattr(multi_run_mod, "_wait_for_pid_exit", lambda *_a, **_kw: None)
+
+    config = SweepConfig(
+        name="lora-live-attach",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        resume=True,
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # Live-attach: no rl-multi-run Popen call, done marker dropped so the
+    # attached launcher knows it can drain.
+    assert rl_popen_calls == []
+    assert (shared_dir / "control" / "done").exists()
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    summary = manifest["summary"]
+    assert summary["completed"] == 2
 
 
 def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -438,24 +418,6 @@ def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, caps
     write_toml(shared_path, {})
 
     _stub_validate_target_config(monkeypatch)
-
-    called: list = []
-
-    import subprocess as real_subprocess
-
-    real_run = real_subprocess.run
-
-    def fake_run(command, env=None, **kwargs):
-        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
-            return real_run(command, **kwargs)
-        called.append(list(command))
-
-        class _R:
-            returncode = 0
-
-        return _R()
-
-    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
 
     config = SweepConfig(
         name="lora-dry",
@@ -474,11 +436,7 @@ def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, caps
 
     run_sweep(config)
 
-    rl_multi_run_calls = [c for c in called if c and c[0] == "rl-multi-run"]
-    assert rl_multi_run_calls == []
-
     out = capsys.readouterr().out
     assert "Materialized 2 run dir(s)" in out
-    # Run dirs exist on disk so the user can inspect orch.toml etc.
     assert (tmp_path / "study" / "shared").exists()
     assert sum(1 for p in (tmp_path / "study" / "shared").glob("run_*")) == 2

@@ -110,6 +110,43 @@ def _validate_concurrency(config: RLConfig, run_dirs: list[Path]) -> None:
 
 
 EXIT_CODE_FILENAME = "exit_code"
+LAUNCHER_PID_FILENAME = ".launcher.pid"
+LAUNCHER_HEARTBEAT_FILENAME = ".launcher.heartbeat"
+
+
+def _write_launcher_pid(shared_dir: Path) -> None:
+    """Record the launcher's PID so resume can detect a still-running launcher.
+
+    Phase 7e: when ``rl-multi-run --watch-slots`` is alive between sweeps the
+    new controller can attach via the file protocol (drop run_*/control/orch.toml,
+    let the watch-slots loop spawn the orchestrators) instead of re-launching
+    trainer + inference. The PID file is paired with a heartbeat that the
+    controller checks for freshness.
+    """
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / LAUNCHER_PID_FILENAME).write_text(f"{os.getpid()}\n")
+
+
+def _touch_launcher_heartbeat(shared_dir: Path) -> None:
+    """Refresh the heartbeat file's mtime — cheap proof of life on each tick."""
+    path = shared_dir / LAUNCHER_HEARTBEAT_FILENAME
+    path.touch()
+
+
+def _cleanup_launcher_pid_files(shared_dir: Path) -> None:
+    """Remove PID and heartbeat files on orderly exit.
+
+    Resume's freshness check rejects stale files, so leaving them behind is
+    self-correcting — the heartbeat will look stale and the controller will
+    fall back to stop+resume. But cleanup makes diagnosis easier and matches
+    the intent of "this launcher is no longer running".
+    """
+    for filename in (LAUNCHER_PID_FILENAME, LAUNCHER_HEARTBEAT_FILENAME):
+        path = shared_dir / filename
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 def _write_orchestrator_exit_code(run_dir: Path, returncode: int | None) -> None:
@@ -181,7 +218,48 @@ def _watch_slots_loop(
     finished_run_ids: set[str] = set()
     done_marker = shared_dir / "control" / DONE_MARKER_NAME
 
+    _write_launcher_pid(shared_dir)
+
+    try:
+        _run_watch_slots_inner(
+            shared_dir=shared_dir,
+            done_marker=done_marker,
+            log_dir=log_dir,
+            start_command=start_command,
+            wandb_shared_env=wandb_shared_env,
+            supervisor=supervisor,
+            trainer_process=trainer_process,
+            orchestrator_processes=orchestrator_processes,
+            orchestrator_labels=orchestrator_labels,
+            run_dirs=run_dirs,
+            seen_run_ids=seen_run_ids,
+            finished_run_ids=finished_run_ids,
+            sweep_env_var=SWEEP_METRICS_JSONL_ENV,
+        )
+    finally:
+        _cleanup_launcher_pid_files(shared_dir)
+
+
+def _run_watch_slots_inner(
+    *,
+    shared_dir: Path,
+    done_marker: Path,
+    log_dir: Path,
+    start_command: list[str],
+    wandb_shared_env: dict[str, str],
+    supervisor: LaunchSupervisor,
+    trainer_process,
+    orchestrator_processes: list,
+    orchestrator_labels: list[str],
+    run_dirs: list[Path],
+    seen_run_ids: set[str],
+    finished_run_ids: set[str],
+    sweep_env_var: str,
+) -> None:
+    """Body of the watch-slots loop, factored out so the outer wrapper can
+    own PID/heartbeat lifecycle via try/finally without an extra indent."""
     while True:
+        _touch_launcher_heartbeat(shared_dir)
         # 1. Reap finished orchestrators (write per-run exit_code).
         for proc, run_dir in zip(orchestrator_processes, run_dirs):
             if run_dir.name in finished_run_ids:
@@ -210,7 +288,7 @@ def _watch_slots_loop(
                 wandb_shared_env=wandb_shared_env,
                 wandb_program="uv run rl-multi-run",
                 supervisor=supervisor,
-                extra_env={SWEEP_METRICS_JSONL_ENV: (new_run_dir / "metrics.jsonl").as_posix()},
+                extra_env={sweep_env_var: (new_run_dir / "metrics.jsonl").as_posix()},
             )
             orchestrator_processes.append(new_proc)
             orchestrator_labels.append(label)
