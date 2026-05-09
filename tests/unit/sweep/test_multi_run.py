@@ -343,6 +343,95 @@ def test_multi_run_lora_sweep_marks_all_failed_when_exit_codes_missing(
         assert status["returncode"] == 2
 
 
+def test_multi_run_lora_sweep_resume_skips_already_completed_trials(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Phase 7c: ``--resume`` only relaunches trials whose prior status is
+    ``pending`` (or running, treated as pending). Completed/pruned/failed
+    trials keep their preserved artifacts and stay out of the new
+    ``rl-multi-run`` invocation."""
+    shared_path = tmp_path / "shared.toml"
+    write_toml(shared_path, {})
+
+    _stub_validate_target_config(monkeypatch)
+
+    base_config_kwargs = dict(
+        name="lora-resume",
+        entrypoint="rl",
+        base=[shared_path],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 3,
+            "shared": [shared_path],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5, 3e-5, 1e-4]}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    # Run 1: every trial completes with a different reward.
+    rewards_run_1 = {0: 0.4, 1: 0.7, 2: 0.3}
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run_completed(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        idx = command.index("--runs-dir")
+        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
+        for run_dir in run_dirs:
+            trial_index = int(run_dir.name.removeprefix("run_").split("-", 1)[0])
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "metrics.jsonl").write_text(
+                json.dumps({"step": 1, "reward": rewards_run_1[trial_index]}) + "\n"
+            )
+            (run_dir / "control").mkdir(parents=True, exist_ok=True)
+            (run_dir / "control" / "exit_code").write_text("0\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run_completed)
+    run_sweep(SweepConfig(**base_config_kwargs))
+
+    # Confirm run 1 left every trial completed.
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    for variant in manifest["variants"]:
+        status = json.loads(Path(variant["status_path"]).read_text())
+        assert status["state"] == "completed"
+
+    # Run 2 with --resume: simulate every trial as a launcher that, if it
+    # ran, would mark trials with a totally different reward. If resume
+    # works, the launcher is *not* invoked at all because every trial is
+    # already terminal.
+    invoked: list = []
+
+    def fake_run_should_not_invoke(command, env=None, **kwargs):
+        if command[:2] == ["git", "rev-parse"] or command[:2] == ["git", "status"]:
+            return real_run(command, **kwargs)
+        invoked.append(list(command))
+        # Defensive: if resume skips correctly we never hit this branch.
+        idx = command.index("--runs-dir")
+        run_dirs = [Path(p) for p in command[idx + 1].split(":") if p]
+        for run_dir in run_dirs:
+            (run_dir / "control").mkdir(parents=True, exist_ok=True)
+            (run_dir / "control" / "exit_code").write_text("0\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run_should_not_invoke)
+    run_sweep(SweepConfig(**base_config_kwargs, resume=True))
+
+    # No rl-multi-run invocation: every trial was already terminal.
+    rl_multi_run_calls = [c for c in invoked if c and c[0] == "rl-multi-run"]
+    assert rl_multi_run_calls == []
+
+    # Manifest summary still reflects run-1 history (best_value is the
+    # winning trial's objective from the original run).
+    manifest_after = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    assert manifest_after["summary"]["best_value"] == 0.7
+
+
 def test_multi_run_lora_dry_run_lists_run_dirs(tmp_path: Path, monkeypatch, capsys) -> None:
     """dry_run materializes the layout but does not invoke rl-multi-run."""
     shared_path = tmp_path / "shared.toml"

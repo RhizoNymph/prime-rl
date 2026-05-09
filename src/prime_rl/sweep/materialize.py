@@ -149,17 +149,25 @@ def _merge_wandb_overrides(config: SweepConfig, flat_overrides: dict[str, Any], 
 
 TERMINAL_RESUME_STATES = frozenset({"completed", "submitted"})
 
+# multi_run_lora trials have a richer terminal set: pruned and failed trials
+# have already been told to Optuna (or recorded against the manifest summary)
+# and shouldn't be re-run on resume.
+MULTI_RUN_TERMINAL_RESUME_STATES = frozenset({"completed", "pruned", "failed"})
+
 
 class SweepDriftError(RuntimeError):
     """Raised when --resume would skip a trial whose effective config has changed."""
 
 
-def _existing_terminal_status(status_path: Path) -> dict[str, Any] | None:
+def _existing_terminal_status(
+    status_path: Path,
+    terminal_states: frozenset[str] = TERMINAL_RESUME_STATES,
+) -> dict[str, Any] | None:
     """Return parsed status.json if its state should be preserved on resume."""
     if not status_path.exists():
         return None
     status = json.loads(status_path.read_text())
-    if status.get("state") in TERMINAL_RESUME_STATES:
+    if status.get("state") in terminal_states:
         return status
     return None
 
@@ -302,6 +310,8 @@ def materialize_multi_run_trial(
     config: SweepConfig,
     trial: Trial,
     scheduler: Any,  # MultiRunLoRASchedulerConfig — typed as Any to avoid an import cycle
+    resume: bool = False,
+    expected_checksums: dict[str, Any] | None = None,
 ) -> TrialArtifacts:
     """Write a per-trial ``run_<id>/control/orch.toml`` for a shared-trainer sweep.
 
@@ -350,19 +360,25 @@ def materialize_multi_run_trial(
     resolved_checksum = file_checksum(resolved_path)
     base_checksums = {base.as_posix(): file_checksum(base) for base in scheduler.shared}
 
-    write_json(
-        status_path,
-        {
-            "id": trial.id,
-            "label": trial.label,
-            "state": "pending",
-            "pid": None,
-            "slurm_job_id": None,
-            "gpu_group": None,
-            "returncode": None,
-            "objective": None,
-        },
+    preserved_status = (
+        _existing_terminal_status(status_path, MULTI_RUN_TERMINAL_RESUME_STATES) if resume else None
     )
+    if preserved_status is not None:
+        _check_resume_drift(trial, preserved_status, expected_checksums, resolved_checksum, base_checksums)
+    else:
+        write_json(
+            status_path,
+            {
+                "id": trial.id,
+                "label": trial.label,
+                "state": "pending",
+                "pid": None,
+                "slurm_job_id": None,
+                "gpu_group": None,
+                "returncode": None,
+                "objective": None,
+            },
+        )
 
     return TrialArtifacts(
         trial=trial,

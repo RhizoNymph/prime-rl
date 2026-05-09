@@ -508,20 +508,26 @@ def test_multi_run_lora_rejects_sft_entrypoint(tmp_path: Path) -> None:
         )
 
 
-def test_multi_run_lora_rejects_resume(tmp_path: Path) -> None:
-    """Phase 7a: resume against a still-running shared trainer is deferred."""
-    with pytest.raises(ValidationError, match="Resume is not supported"):
-        SweepConfig(
-            base=[tmp_path / "base.toml"],
-            output_dir=tmp_path / "study",
-            scheduler={
-                "type": "multi_run_lora",
-                "max_concurrent_runs": 2,
-                "shared": [tmp_path / "shared.toml"],
-            },
-            parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
-            resume=True,
-        )
+def test_multi_run_lora_accepts_resume(tmp_path: Path) -> None:
+    """Phase 7c: stop+resume against a multi_run_lora study is supported.
+
+    Live-attach (resuming against a still-running trainer torchrun) is still
+    deferred; resume here means re-launching ``rl-multi-run`` for the un-run
+    trials after the prior controller exited.
+    """
+    config = SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={
+            "type": "multi_run_lora",
+            "max_concurrent_runs": 2,
+            "shared": [tmp_path / "shared.toml"],
+        },
+        parameters={"orchestrator.optim.lr": {"values": [1e-5]}},
+        resume=True,
+    )
+    assert config.resume is True
+    assert config.scheduler.type == "multi_run_lora"
 
 
 def test_multi_run_lora_accepts_optuna_strategy(tmp_path: Path) -> None:

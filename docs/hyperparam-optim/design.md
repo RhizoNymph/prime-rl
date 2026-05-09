@@ -1061,15 +1061,57 @@ Phase 7b (shipped):
   each wave), so early pruning can lag one wave for ``MedianPruner`` /
   ``Hyperband`` to accumulate context.
 
-Deferred to Phase 7c:
+Phase 7c (shipped):
 
-- **Resume against a still-running shared trainer.** Validator still
-  rejects ``resume + multi_run_lora``; needs PID/heartbeat tracking of
-  the trainer torchrun and a re-attach path on the launcher side.
-- **Dynamic slot replacement / auto-retry.** Pruned or failed slots stay
-  idle until their wave finishes. True slot replacement requires
-  ``rl-multi-run`` to accept new run dirs over the wire (or to be a
-  long-lived daemon).
+- **Stop+resume for ``multi_run_lora``.** The validator's
+  ``resume + multi_run_lora`` rejection is gone. ``--resume`` reloads
+  the prior manifest, runs ``_check_resume_drift`` against each trial's
+  resolved checksum, and only re-launches trials whose status was
+  ``pending`` (or ``running``, treated as pending — controller-crash
+  case). Completed/pruned/failed trials keep their preserved artifacts.
+  For Optuna mode, the study reloads from ``strategy.storage`` and
+  ``_reconcile_running_trials`` settles any RUNNING trials left behind
+  by a controller crash so the study count is consistent. *Live-attach*
+  (controller resumes against a still-running trainer torchrun) is
+  still deferred — see 7d.
+- **Continuous-flow Optuna driver.** The 7b wave loop is replaced by a
+  single ``rl-multi-run --watch-slots`` invocation that spans the whole
+  sweep. The controller maintains target concurrency =
+  ``max_concurrent_runs`` live trials, asking Optuna for a replacement
+  the moment any slot frees instead of waiting for a wave to finish.
+  When all trials have been told the controller writes
+  ``<shared_dir>/control/done`` and the launcher tears down. Wave-mode
+  GPU waste on heavily-pruned sweeps is gone; cross-trial pruning gets
+  fresher signal because the sampler sees each ``study.tell`` as soon
+  as the trial finishes (vs once per wave in 7b).
+- **``rl-multi-run --watch-slots`` flag.** The launcher's new mode
+  rescans the parent of ``--runs-dir`` every couple seconds for
+  ``run_*/control/orch.toml`` files it hasn't seen and spawns
+  orchestrators on demand. Per-orchestrator ``control/exit_code`` files
+  are written individually as each orchestrator exits (vs batched at
+  shutdown in 7b) so the controller can observe each completion in
+  real time. Default mode is unchanged: without ``--watch-slots`` the
+  launcher waits for the initial cohort to finish and exits.
+
+Deferred to Phase 7d:
+
+- **Live-attach resume.** Controller resuming against a *still-running*
+  trainer torchrun (a different process from the controller that
+  owned the prior sweep). Needs PID file at
+  ``<shared_dir>/.launcher.pid``, heartbeat freshness check, and a
+  hand-off protocol so the new controller can pick up the slot-watch
+  loop. Out of scope for 7c — practical resume covers the
+  controller-crash case where the trainer is dead too.
+- **Auto-retry for failed orchestrators.** A failed trial with
+  ``attempts < retry_budget`` could be re-materialized into a fresh
+  ``run_<id>-r<N>`` dir with the same params. Orthogonal to
+  continuous-flow because it adds a retry-naming axis on top of trial
+  IDs; pulled into a follow-up to keep 7c focused.
+- **Static (grid/random) continuous-flow.** Static mode keeps wave
+  semantics with the 7a "max_concurrent_runs >= num_trials" limit.
+  Grid sweeps that need streaming concurrency can use Optuna with a
+  random sampler as a workaround until the static driver gets the
+  same continuous-flow pattern.
 
 ### Phase 8: SLURM Arrays
 

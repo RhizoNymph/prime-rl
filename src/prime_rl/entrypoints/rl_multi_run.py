@@ -23,6 +23,7 @@ import argparse
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from prime_rl.configs.rl import RLConfig
@@ -51,16 +52,23 @@ from prime_rl.utils.process import cleanup_processes, cleanup_threads, set_proc_
 from prime_rl.utils.utils import get_log_dir
 
 RUNS_DIR_FLAG = "--runs-dir"
+WATCH_SLOTS_FLAG = "--watch-slots"
+DONE_MARKER_NAME = "done"
+SLOT_POLL_INTERVAL_SECONDS = 2.0
 
 
-def _parse_runs_dirs(argv: list[str]) -> tuple[list[Path], list[str]]:
-    """Peel ``--runs-dir <colon-separated paths>`` off argv before pydantic_config.
+def _parse_runs_dirs(argv: list[str]) -> tuple[list[Path], bool, list[str]]:
+    """Peel ``--runs-dir`` and ``--watch-slots`` off argv before pydantic_config.
 
-    Returns ``(run_dirs, remaining_argv)``. The remaining argv is passed to
-    ``cli(RLConfig)`` so the standard ``@ shared.toml`` syntax keeps working.
+    Returns ``(run_dirs, watch_slots, remaining_argv)``. The remaining argv
+    is passed to ``cli(RLConfig)`` so the standard ``@ shared.toml`` syntax
+    keeps working. ``--watch-slots`` is the Phase 7c continuous-flow toggle:
+    when set, the launcher keeps watching the parent of ``run_dirs`` for new
+    ``run_*/control/orch.toml`` files and spawns orchestrators on demand.
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(RUNS_DIR_FLAG, required=True)
+    parser.add_argument(WATCH_SLOTS_FLAG, action="store_true")
     namespace, remaining = parser.parse_known_args(argv)
     raw = namespace.runs_dir
     if not raw:
@@ -68,7 +76,7 @@ def _parse_runs_dirs(argv: list[str]) -> tuple[list[Path], list[str]]:
     run_dirs = [Path(piece).resolve() for piece in raw.split(":") if piece]
     if not run_dirs:
         raise SystemExit(f"{RUNS_DIR_FLAG} parsed to no run directories: {raw!r}")
-    return run_dirs, remaining
+    return run_dirs, bool(namespace.watch_slots), remaining
 
 
 def _validate_run_layout(run_dirs: list[Path]) -> None:
@@ -136,7 +144,93 @@ def _record_orchestrator_exit_codes(
             continue
 
 
-def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
+def _watch_slots_loop(
+    *,
+    shared_dir: Path,
+    log_dir: Path,
+    start_command: list[str],
+    wandb_shared_env: dict[str, str],
+    supervisor: LaunchSupervisor,
+    trainer_process,
+    orchestrator_processes: list,
+    orchestrator_labels: list[str],
+    run_dirs: list[Path],
+) -> None:
+    """Watch for new ``run_*/control/orch.toml`` files and spawn orchestrators.
+
+    Runs after the initial orchestrator + trainer spawn. Mutates the
+    caller-owned lists in place so existing teardown / exit-code recording
+    continues to work without changes. Exits when:
+
+    1. The trainer exits — natural shutdown, no more progress possible.
+    2. ``<shared_dir>/control/done`` exists *and* every tracked orchestrator
+       has exited. The sweep controller writes ``done`` when it has no more
+       trials to schedule, so the launcher can drain remaining orchestrators
+       and tear down the trainer instead of waiting forever for new work.
+
+    Per-orchestrator exit codes are written individually as each orchestrator
+    exits, so the sweep controller can observe each completion in real time
+    (continuous-flow needs that to know when to ask Optuna for a replacement).
+    The ``_record_orchestrator_exit_codes`` batch call on shutdown re-writes
+    them, which is harmless — the file content is identical.
+    """
+    # Lazy import to keep this helper testable without sweep dependencies.
+    from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
+
+    seen_run_ids: set[str] = {d.name for d in run_dirs}
+    finished_run_ids: set[str] = set()
+    done_marker = shared_dir / "control" / DONE_MARKER_NAME
+
+    while True:
+        # 1. Reap finished orchestrators (write per-run exit_code).
+        for proc, run_dir in zip(orchestrator_processes, run_dirs):
+            if run_dir.name in finished_run_ids:
+                continue
+            if proc.poll() is None:
+                continue
+            try:
+                _write_orchestrator_exit_code(run_dir, proc.returncode)
+            except OSError:
+                pass
+            finished_run_ids.add(run_dir.name)
+
+        # 2. Discover new run_* directories with control/orch.toml.
+        for new_run_dir in sorted(shared_dir.glob("run_*")):
+            if new_run_dir.name in seen_run_ids:
+                continue
+            orch_config = new_run_dir / "control" / "orch.toml"
+            if not orch_config.exists():
+                continue
+            label = f"orchestrator-{new_run_dir.name}"
+            new_proc = start_orchestrator(
+                config_path=orch_config,
+                label=label,
+                log_path=log_dir / f"{label}.log",
+                start_command=start_command,
+                wandb_shared_env=wandb_shared_env,
+                wandb_program="uv run rl-multi-run",
+                supervisor=supervisor,
+                extra_env={SWEEP_METRICS_JSONL_ENV: (new_run_dir / "metrics.jsonl").as_posix()},
+            )
+            orchestrator_processes.append(new_proc)
+            orchestrator_labels.append(label)
+            run_dirs.append(new_run_dir)
+            seen_run_ids.add(new_run_dir.name)
+
+        # 3. Surface monitor-thread errors as before.
+        if supervisor.error_queue:
+            return
+
+        # 4. Exit conditions.
+        if trainer_process.poll() is not None:
+            return
+        if done_marker.exists() and all(p.poll() is not None for p in orchestrator_processes):
+            return
+
+        time.sleep(SLOT_POLL_INTERVAL_SECONDS)
+
+
+def rl_multi_run(config: RLConfig, run_dirs: list[Path], watch_slots: bool = False) -> None:
     assert config.deployment.type == "single_node", "rl-multi-run is single-node only"
     _validate_concurrency(config, run_dirs)
     _validate_run_layout(run_dirs)
@@ -248,10 +342,28 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         logger.success("Startup complete. Showing trainer logs...")
         tail_trainer_log(supervisor, log_dir / "trainer.log")
 
-        # Trainer winding down implies all orchestrators completed; the
-        # supervisor still requires every orchestrator's stop_event to fire,
-        # which they do as their subprocesses exit.
-        wait_for_completion(orchestrator_labels + ["trainer"], supervisor)
+        if watch_slots:
+            # Phase 7c continuous-flow: stay alive while the controller drops
+            # new run_*/control/orch.toml files into the shared dir, spawning
+            # orchestrators on demand. The trainer's MultiRunManager picks up
+            # the same directories on its own discovery cycle.
+            shared_dir = run_dirs[0].parent
+            _watch_slots_loop(
+                shared_dir=shared_dir,
+                log_dir=log_dir,
+                start_command=start_command,
+                wandb_shared_env=wandb_shared_env,
+                supervisor=supervisor,
+                trainer_process=trainer_process,
+                orchestrator_processes=orchestrator_processes,
+                orchestrator_labels=orchestrator_labels,
+                run_dirs=run_dirs,
+            )
+        else:
+            # Trainer winding down implies all orchestrators completed; the
+            # supervisor still requires every orchestrator's stop_event to fire,
+            # which they do as their subprocesses exit.
+            wait_for_completion(orchestrator_labels + ["trainer"], supervisor)
 
         # Per-orchestrator exit_code is the sweep controller's source of
         # truth for failure attribution; write it as soon as we've waited
@@ -296,9 +408,9 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
 
 def main():
     set_proc_title("MultiRunLauncher")
-    run_dirs, remaining = _parse_runs_dirs(sys.argv[1:])
+    run_dirs, watch_slots, remaining = _parse_runs_dirs(sys.argv[1:])
     config = cli(RLConfig, args=remaining)
-    rl_multi_run(config, run_dirs)
+    rl_multi_run(config, run_dirs, watch_slots=watch_slots)
 
 
 if __name__ == "__main__":
