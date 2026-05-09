@@ -19,7 +19,6 @@ file is *not* used to launch a process here; only the per-run ``orch.toml``
 files referenced via ``--runs-dir`` produce orchestrators.
 """
 
-import argparse
 import os
 import signal
 import sys
@@ -44,31 +43,12 @@ from prime_rl.entrypoints.rl import (
     get_physical_gpu_ids,
     write_subconfigs,
 )
+from prime_rl.entrypoints.rl_multi_run_args import RUNS_DIR_FLAG, parse_runs_dirs
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 from prime_rl.utils.process import cleanup_processes, cleanup_threads, set_proc_title
 from prime_rl.utils.utils import get_log_dir
-
-RUNS_DIR_FLAG = "--runs-dir"
-
-
-def _parse_runs_dirs(argv: list[str]) -> tuple[list[Path], list[str]]:
-    """Peel ``--runs-dir <colon-separated paths>`` off argv before pydantic_config.
-
-    Returns ``(run_dirs, remaining_argv)``. The remaining argv is passed to
-    ``cli(RLConfig)`` so the standard ``@ shared.toml`` syntax keeps working.
-    """
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(RUNS_DIR_FLAG, required=True)
-    namespace, remaining = parser.parse_known_args(argv)
-    raw = namespace.runs_dir
-    if not raw:
-        raise SystemExit(f"{RUNS_DIR_FLAG} must list at least one run directory")
-    run_dirs = [Path(piece).resolve() for piece in raw.split(":") if piece]
-    if not run_dirs:
-        raise SystemExit(f"{RUNS_DIR_FLAG} parsed to no run directories: {raw!r}")
-    return run_dirs, remaining
 
 
 def _validate_run_layout(run_dirs: list[Path]) -> None:
@@ -296,7 +276,7 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
 
 def main():
     set_proc_title("MultiRunLauncher")
-    run_dirs, remaining = _parse_runs_dirs(sys.argv[1:])
+    run_dirs, remaining = parse_runs_dirs(sys.argv[1:])
     config = cli(RLConfig, args=remaining)
     rl_multi_run(config, run_dirs)
 

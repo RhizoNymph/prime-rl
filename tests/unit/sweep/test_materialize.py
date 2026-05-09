@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 
 import tomli
@@ -173,10 +174,19 @@ def _stub_resolved_rl_config(monkeypatch, captured: dict) -> None:
         orch = captured["overrides"].get("orchestrator", {})
 
         class FakeOrch:
-            def model_dump(self, *, exclude_none=True, mode="json"):
-                return orch
+            def __init__(self, source: dict) -> None:
+                self._source = source
+                self.output_dir = Path("/auto-setup/run_default")
 
-        return SimpleNamespace(orchestrator=FakeOrch())
+            def model_dump(self, *, exclude_none=True, mode="json"):
+                data = dict(self._source)
+                output_dir = self.output_dir
+                data["output_dir"] = (
+                    output_dir.as_posix() if isinstance(output_dir, Path) else output_dir
+                )
+                return data
+
+        return SimpleNamespace(orchestrator=FakeOrch(orch))
 
     monkeypatch.setattr(mat_mod, "validate_target_config", fake_validate)
 
@@ -222,6 +232,23 @@ def test_materialize_multi_run_trial_writes_run_layout(tmp_path: Path, monkeypat
     # would land somewhere the controller never reads.
     assert captured["overrides"]["orchestrator"]["output_dir"] == expected_run_dir.as_posix()
     assert captured["overrides"]["orchestrator"]["optim"]["lr"] == 1e-5
+    assert read_toml(artifact.resolved_path)["output_dir"] == expected_run_dir.as_posix()
+    assert read_toml(expected_run_dir / "control" / "orch.toml")["output_dir"] == expected_run_dir.as_posix()
+
+    from prime_rl.entrypoints.rl_multi_run_args import parse_runs_dirs
+
+    command = shlex.split(artifact.command_path.read_text().strip())
+    run_dirs, remaining_argv = parse_runs_dirs(command[1:])
+    output_override_path = tmp_path / "study" / "shared" / "_output_override.toml"
+    assert command[0] == "rl-multi-run"
+    assert run_dirs == [expected_run_dir.resolve()]
+    assert remaining_argv == [
+        "@",
+        shared_path.as_posix(),
+        "@",
+        output_override_path.as_posix(),
+    ]
+    assert read_toml(output_override_path)["output_dir"] == (tmp_path / "study" / "shared").as_posix()
 
     status = json.loads(artifact.status_path.read_text())
     assert status["state"] == "pending"

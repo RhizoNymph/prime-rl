@@ -298,6 +298,21 @@ def multi_run_trial_dir(config: SweepConfig, trial: Trial) -> Path:
     return multi_run_shared_dir(config) / f"run_{trial.id}"
 
 
+def write_multi_run_output_override(shared_dir: Path) -> Path:
+    """Write the trainer ``output_dir`` pin used by ``rl-multi-run`` launches.
+
+    Pinning ``output_dir = <shared_dir>`` keeps the trainer's
+    ``MultiRunManager`` scanning the right ``run_*`` slots regardless of what
+    the base TOML carries. Materialization and the launcher both call this so
+    the override file is a known, replayable artifact rather than an
+    implementation detail of ``build_multi_run_command``.
+    """
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    path = shared_dir / "_output_override.toml"
+    path.write_text(f'output_dir = "{shared_dir.as_posix()}"\n')
+    return path
+
+
 def materialize_multi_run_trial(
     config: SweepConfig,
     trial: Trial,
@@ -339,12 +354,28 @@ def materialize_multi_run_trial(
     args.extend(["@", overrides_path.as_posix()])
 
     resolved_rl_config = validate_target_config("rl", args)
+    # RLConfig.auto_setup_output_dir resets orchestrator.output_dir to
+    # ``<top-level output_dir>/run_default`` during validation, which would
+    # collapse every trial onto the same orchestrator directory. Restore the
+    # per-trial path so each orch.toml targets its own run_<id> slot.
+    resolved_rl_config.orchestrator.output_dir = run_dir
     orchestrator_dict = resolved_rl_config.orchestrator.model_dump(exclude_none=True, mode="json")
 
     write_toml(resolved_path, orchestrator_dict)
     write_toml(orch_config_path, orchestrator_dict)
 
-    command = ["rl-multi-run", "@", *(p.as_posix() for p in scheduler.shared), f"--run={run_dir.as_posix()}"]
+    # Mirror what build_multi_run_command issues so this command.txt is
+    # actually replayable: rl-multi-run requires --runs-dir with
+    # colon-separated paths, plus the trainer output_dir pin.
+    output_override_path = write_multi_run_output_override(multi_run_shared_dir(config))
+    command = [
+        "rl-multi-run",
+        *sum((["@", p.as_posix()] for p in scheduler.shared), []),
+        "@",
+        output_override_path.as_posix(),
+        "--runs-dir",
+        run_dir.as_posix(),
+    ]
     command_path.write_text(" ".join(command) + "\n")
 
     resolved_checksum = file_checksum(resolved_path)

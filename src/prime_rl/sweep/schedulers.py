@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from prime_rl.sweep.materialize import TrialArtifacts, write_json
+from prime_rl.sweep.materialize import TrialArtifacts, write_json, write_multi_run_output_override
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 
 TrialCompleteCallback = Callable[[TrialArtifacts, int], bool]
@@ -267,9 +267,7 @@ def build_multi_run_command(
     Pulled out so the Optuna wave driver can spawn the same command via
     ``Popen`` (for mid-flight pruning) instead of ``subprocess.run``.
     """
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    output_override_path = shared_dir / "_output_override.toml"
-    output_override_path.write_text(f'output_dir = "{shared_dir.as_posix()}"\n')
+    output_override_path = write_multi_run_output_override(shared_dir)
 
     command: list[str] = ["rl-multi-run"]
     for path in shared_paths:

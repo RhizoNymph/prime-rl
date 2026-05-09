@@ -79,7 +79,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 Materializes and launches hyperparameter sweep trials for `rl` or `sft` target configs.
 
-Phase 1 supports grid sweeps over dotted target config paths. Each trial writes `overrides.toml`, `resolved.toml`, `command.txt`, and `status.json` under the study output directory, then launches the target entrypoint with the configured base files plus the generated `overrides.toml` unless `--dry-run` is set.
+Sweeps support grid/random/Optuna strategies over dotted target config paths. Standard trials write `overrides.toml`, `resolved.toml`, `command.txt`, and `status.json` under the study output directory, then launch the target entrypoint with the configured base files plus the generated `overrides.toml` unless `--dry-run` is set.
+
+`multi_run_lora` sweeps materialize each trial under `shared/run_<trial_id>/`, write the per-run orchestrator config to `control/orch.toml`, and keep `orchestrator.output_dir` pinned to that run directory after `RLConfig` validation. Their replay command uses the shared trainer configs, the generated `shared/_output_override.toml`, and `--runs-dir <run_dir>` so it goes through the same parser as `rl-multi-run`.
 
 - **Config:** `SweepConfig` (`src/prime_rl/configs/sweep.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/sweep.py`
