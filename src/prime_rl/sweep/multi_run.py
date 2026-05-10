@@ -13,6 +13,7 @@ the bridge plus the wave driver that runs Optuna against ``rl-multi-run``.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from dataclasses import asdict
@@ -24,6 +25,7 @@ from prime_rl.configs.sweep import (
     OptunaStrategyConfig,
     SweepConfig,
 )
+from prime_rl.sweep import materialize as _materialize
 from prime_rl.sweep.early_stopping import TrialOutcome, TrialOutcomeTracker
 from prime_rl.sweep.materialize import (
     TrialArtifacts,
@@ -57,6 +59,52 @@ if TYPE_CHECKING:  # pragma: no cover
     import optuna
 
 EVICTED_FILENAME = "evicted.txt"
+
+# Subdirs the trainer writes under its ``output_dir`` between runs. Each
+# Optuna wave starts a fresh trainer pinned to ``shared_dir``, so leftover
+# state from a previous wave (checkpoints, weights, broadcasts, rollouts)
+# would be picked up by the new trainer — silently resuming with stale
+# checkpoints, or colliding on ``step_*`` writes. Per-trial ``run_<id>``
+# directories are *not* listed here; the controller manages those via
+# ``_mark_inactive_multi_run_dirs_evicted``.
+_TRAINER_OWNED_SUBDIRS = ("weights", "broadcasts", "rollouts", "run_default")
+
+
+def _resolve_shared_ckpt_dir(shared_paths: list[Path], shared_dir: Path) -> Path:
+    """Find where the shared trainer's checkpoints land for this study.
+
+    Falls back to ``<shared_dir>/checkpoints`` when ``ckpt.output_dir`` is
+    not set in the shared RLConfig (the auto_setup_ckpt default).
+    """
+    args: list[str] = []
+    for base in shared_paths:
+        args.extend(["@", base.as_posix()])
+    resolved = _materialize.validate_target_config("rl", args)
+    ckpt = getattr(resolved, "ckpt", None)
+    override = getattr(ckpt, "output_dir", None) if ckpt is not None else None
+    if override is not None:
+        return Path(override) / "checkpoints"
+    return shared_dir / "checkpoints"
+
+
+def _reset_trainer_state_for_wave(shared_dir: Path, ckpt_dir: Path) -> None:
+    """Wipe trainer-owned artifacts before launching the next Optuna wave.
+
+    Each wave runs a fresh ``rl-multi-run`` whose trainer pins
+    ``output_dir = shared_dir``. Without this reset, the trainer for wave
+    N+1 starts on top of wave N's checkpoints, weights, and step files;
+    checkpoint-enabled configs would silently resume from stale state, and
+    broadcast/rollout step directories from the prior wave would collide
+    with the new run's step 0 writes. Per-trial ``run_<id>`` directories
+    are intentionally preserved — the sweep controller materializes them
+    before this function runs.
+    """
+    if ckpt_dir.exists():
+        shutil.rmtree(ckpt_dir)
+    for subdir in _TRAINER_OWNED_SUBDIRS:
+        path = shared_dir / subdir
+        if path.exists():
+            shutil.rmtree(path)
 
 
 def prune_run(
@@ -250,16 +298,27 @@ def run_multi_run_optuna_sweep(
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping)
     shared_dir = multi_run_shared_dir(config)
     shared_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = _resolve_shared_ckpt_dir(scheduler.shared, shared_dir)
 
     all_artifacts: list[TrialArtifacts] = []
     failures = 0
     submitted = 0
+    wave_index = 0
 
     while submitted < total:
         if tracker.halted:
             break
         this_wave = min(wave_size, total - submitted)
         stop_after_wave = False
+
+        # Wipe trainer-owned artifacts from the prior wave before
+        # materializing or launching this one. Wave 0 starts on a clean
+        # ``shared_dir`` (just created above), so this is a no-op then;
+        # subsequent waves inherit checkpoints/weights/broadcasts/rollouts
+        # from the previous trainer and would otherwise resume or collide.
+        if wave_index > 0:
+            _reset_trainer_state_for_wave(shared_dir, ckpt_dir)
+        wave_index += 1
 
         # 1. Ask Optuna for `this_wave` trials and materialize each.
         # Failed materializations are excluded from the launch wave but kept

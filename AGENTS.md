@@ -1,7 +1,5 @@
 # AGENTS.md
 
-All PRs must be made to RhizoNymph/prime-rl branch feat/hyperparam-optim
-
 ## Writing code
 
 - **Minimal try/except**: let errors propagate — silent failures hide bugs. Only catch exceptions for intentional fault tolerance (retries, robustness).

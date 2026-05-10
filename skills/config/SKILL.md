@@ -140,7 +140,41 @@ uv run inference --vllm-extra '{"key1": "value1", "key2": 123}'
 
 ### Sweep parameter paths
 
-Sweep configs use dotted target config paths under `[parameters]`. The sweep launcher converts these to generated override TOML files and then validates the target `rl` or `sft` config normally:
+Sweep configs name a target entrypoint, one or more base config files, an output directory, a strategy, a scheduler, optional objective/stopping rules, and dotted target config paths under `[parameters]`. The sweep launcher converts parameters to generated override TOML files and then validates the target `rl` or `sft` config normally:
+
+```toml
+name = "reverse-text-lr"
+entrypoint = "rl"
+base = ["examples/reverse_text/rl.toml"]
+output_dir = "outputs/studies/reverse-text-lr"
+
+[strategy]
+type = "grid"
+
+[scheduler]
+type = "local"
+max_parallel = 1
+
+[objective]
+metric = "reward/reverse-text/mean"
+direction = "maximize"
+```
+
+Use `strategy.type = "grid"` for exhaustive choice combinations, `random` for seeded independent samples, and `optuna` for adaptive ask/tell studies. Optuna requires the `hpo` extra (`uv sync --extra hpo`), an `[objective]`, and local or `multi_run_lora` scheduling. Persistent Optuna resume requires `strategy.storage`, usually a SQLite URL such as `sqlite:///outputs/studies/name/optuna.db`.
+
+Schedulers are `local`, `slurm`, and `multi_run_lora`. Local parallel sweeps require explicit disjoint GPU groups:
+
+```toml
+[scheduler]
+type = "local"
+max_parallel = 2
+
+[scheduler.gpu_assignment]
+mode = "static"
+visible_devices = [[0, 1], [2, 3]]
+```
+
+SLURM sweeps submit through each target config's existing `[slurm]` support and exit after submission, so they cannot use early stopping or Optuna. `multi_run_lora` is RL-only and uses one shared trainer plus one orchestrator per trial; its `shared` config list describes the shared RL stack, while `base` is still the target config list used for study materialization.
 
 ```toml
 [parameters."trainer.optim.lr"]
@@ -209,7 +243,7 @@ In TOML, an empty section header does the same:
 
 ## Key files
 
-- `src/prime_rl/utils/config.py` — re-exports `BaseConfig` and `cli` from pydantic_config
-- `src/prime_rl/configs/` — all domain-specific config classes
+- `packages/prime-rl-configs/src/prime_rl/utils/config.py` — re-exports `BaseConfig` and `cli` from pydantic_config
+- `packages/prime-rl-configs/src/prime_rl/configs/` — all domain-specific config classes
 - `configs/debug/` — minimal debug configs for testing
 - `examples/` — full example configs for various tasks

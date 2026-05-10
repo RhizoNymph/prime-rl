@@ -68,8 +68,13 @@ For more details on multi-node deployment options, see the [deployment](deployme
 
 ## Sweep
 
-The `sweep` entrypoint materializes and launches grid sweep trials for `rl` or `sft` target configs.
+The `sweep` entrypoint materializes and launches hyperparameter studies for `rl` or `sft` target configs. It supports grid, random, and Optuna strategies, with local execution, SLURM submission, and shared-trainer LoRA sweeps for RL.
 
-Each trial gets a stable directory under the study output directory with generated `overrides.toml`, fully resolved `resolved.toml`, `command.txt`, and `status.json`. The launcher validates every target trial config before launching. SLURM sweeps reuse the target `rl` or `sft` config's existing `[slurm]` support.
+Each trial gets a stable directory under the study output directory with generated `overrides.toml`, fully resolved `resolved.toml`, `command.txt`, and `status.json`. The launcher validates every target trial config before launching. Objective tracking reads sweep sidecar metrics when configured, and SLURM sweeps reuse the target `rl` or `sft` config's existing `[slurm]` support.
 
-To see all sweep configuration options, run `uv run sweep --help`.
+```bash
+uv run sweep @ examples/sweep/grid_local.toml
+uv run sweep @ examples/sweep/grid_local.toml --dry-run
+```
+
+For details on strategies, schedulers, artifacts, resume, and examples, see the [sweeps](sweeps.md) documentation. To see all sweep configuration options, run `uv run sweep --help`.

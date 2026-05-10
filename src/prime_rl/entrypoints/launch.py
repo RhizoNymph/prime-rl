@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from subprocess import Popen
+from subprocess import PIPE, Popen
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 
@@ -276,9 +277,20 @@ def start_trainer(
 def tail_trainer_log(supervisor: LaunchSupervisor, trainer_log: Path) -> Popen:
     """Mirror the trainer log to stdout so the user sees live training output."""
     tail = Popen(
-        f"tail -F '{trainer_log}' | sed -u 's/^\\[[a-zA-Z]*[0-9]*\\]://'",
-        shell=True,
+        ["tail", "-F", trainer_log.as_posix()],
+        stdout=PIPE,
+        stderr=sys.stderr,
+        text=True,
+        bufsize=1,
     )
+
+    def print_trainer_lines() -> None:
+        assert tail.stdout is not None
+        rank_prefix = re.compile(r"^\[[a-zA-Z]*[0-9]*\]:")
+        for line in tail.stdout:
+            print(rank_prefix.sub("", line), end="", flush=True)
+
+    Thread(target=print_trainer_lines, daemon=True).start()
     supervisor.processes.append(tail)
     return tail
 
