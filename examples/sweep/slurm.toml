@@ -1,0 +1,36 @@
+# SLURM scheduler: each trial is submitted as an independent SLURM job.
+#
+# Demonstrates: scheduler.type = "slurm". The sweep controller submits
+# one job per trial via the target entrypoint's existing [slurm] support
+# (rendering and sbatch-ing per-trial scripts) and then exits. Jobs run
+# asynchronously after submission, so the controller cannot tell when
+# they finish — early stopping and Optuna are not supported with this
+# scheduler (validator enforces both rules).
+#
+# Requires:
+#   - The base RLConfig must include a [slurm] block configuring the
+#     queue/partition/resource allocation for each trial.
+#   - sbatch must be on PATH.
+#
+# Run:
+#   uv run sweep @ examples/sweep/slurm.toml
+name = "reverse-text-slurm"
+entrypoint = "rl"
+base = [
+    "examples/reverse_text/rl.toml",
+    "examples/reverse_text/slurm_rl.toml",
+]
+output_dir = "outputs/studies/reverse-text-slurm"
+
+[strategy]
+type = "grid"
+
+[scheduler]
+type = "slurm"
+
+[objective]
+metric = "reward/reverse-text/mean"
+direction = "maximize"
+
+[parameters."trainer.optim.lr"]
+values = [1e-6, 3e-6, 1e-5]
