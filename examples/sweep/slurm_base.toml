@@ -1,0 +1,11 @@
+# SLURM submission settings, chained on top of examples/reverse_text/rl.toml
+# when running examples/sweep/slurm.toml. Edit to match your cluster.
+[slurm]
+job_name = "reverse-text-sweep"
+# partition = "gpu"
+# account = "your-account"
+# time = "01:00:00"
+# nodelist = "node-a,node-b"
+# exclude = "node-bad"
+# template_path = "/path/to/custom_sbatch_template.sh"
+# pre_run_command = "module load cuda/12.8"

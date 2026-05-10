@@ -8,18 +8,16 @@
 # scheduler (validator enforces both rules).
 #
 # Requires:
-#   - The base RLConfig must include a [slurm] block configuring the
-#     queue/partition/resource allocation for each trial.
-#   - sbatch must be on PATH.
+#   - sbatch on PATH.
+#   - A reachable SLURM cluster.
+#   - Edit examples/sweep/slurm_base.toml to set your cluster's
+#     [slurm] partition/account/time/template_path/etc.
 #
 # Run:
 #   uv run sweep @ examples/sweep/slurm.toml
 name = "reverse-text-slurm"
 entrypoint = "rl"
-base = [
-    "examples/reverse_text/rl.toml",
-    "examples/reverse_text/slurm_rl.toml",
-]
+base = ["examples/reverse_text/rl.toml", "examples/sweep/slurm_base.toml"]
 output_dir = "outputs/studies/reverse-text-slurm"
 
 [strategy]
