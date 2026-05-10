@@ -563,6 +563,14 @@ def _run_multi_run_static(config: SweepConfig) -> None:
                 TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
             )
         summary = asdict(tracker.summary())
+
+    # Same fix as run_sweep: refresh variants from each trial's final
+    # status.json so state/objective reflect the post-wave reality, not
+    # the pending values from materialization. Runs outside the
+    # objective-tracker branch so state is also refreshed when no
+    # objective is configured.
+    _write_manifest(config, artifacts)
+    if tracker is not None:
         _update_manifest_summary(config, summary)
         if summary["best_trial_id"] is not None:
             label = tracker.best_label or summary["best_trial_id"]
