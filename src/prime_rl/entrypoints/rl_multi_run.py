@@ -30,6 +30,7 @@ from prime_rl.entrypoints.launch import (
     LaunchSupervisor,
     build_wandb_shared_env,
     compute_gpu_mapping,
+    init_wandb_shared_primary,
     start_inference,
     start_orchestrator,
     start_trainer,
@@ -136,7 +137,15 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
 
     signal.signal(signal.SIGTERM, sigterm_handler)
 
+    launcher_wandb_run = None
     try:
+        # The launcher process owns the shared W&B run so its lifetime matches
+        # the supervisor that waits on every subprocess. Trainer and
+        # orchestrators stay non-primary so neither a trainer that exits at
+        # max_steps nor a pruned orchestrator can mark the run finished while
+        # siblings still have unflushed metrics (e.g. final-eval logs).
+        launcher_wandb_run = init_wandb_shared_primary(config, wandb_shared_env, logger)
+
         if config.inference:
             start_inference(
                 cmd=["inference", "@", (config_dir / INFERENCE_TOML).as_posix()],
@@ -292,6 +301,12 @@ def rl_multi_run(config: RLConfig, run_dirs: list[Path]) -> None:
         cleanup_processes(supervisor.processes)
         record_orchestrator_exit_codes(orchestrator_processes, run_dirs)
         raise
+    finally:
+        # Run finish on every exit path (success, sys.exit, raise, SIGTERM)
+        # so x_update_finish_state fires only after the supervisor has
+        # waited on every subprocess.
+        if launcher_wandb_run is not None:
+            launcher_wandb_run.finish()
 
 
 def main():

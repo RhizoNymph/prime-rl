@@ -51,6 +51,15 @@ def _write_toml(path: Path, data: dict[str, Any]) -> None:
 
 
 def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
+    # Mirror live trial state into the manifest so jq queries against
+    # variants[*].state / variants[*].objective work without separately
+    # reading each status.json. status.json is written at materialization
+    # (state="pending") and updated as trials run, so we always have at
+    # least the pending values to record here.
+    try:
+        status = read_status_json(artifact.status_path) if artifact.status_path.exists() else {}
+    except SweepStatusError:
+        status = {}
     return {
         "id": artifact.trial.id,
         "label": artifact.trial.label,
@@ -60,6 +69,8 @@ def build_variant(artifact: TrialArtifacts) -> dict[str, Any]:
         "status_path": artifact.status_path.as_posix(),
         "resolved_checksum": artifact.resolved_checksum,
         "base_checksums": artifact.base_checksums,
+        "state": status.get("state"),
+        "objective": status.get("objective"),
     }
 
 
@@ -552,6 +563,14 @@ def _run_multi_run_static(config: SweepConfig) -> None:
                 TrialOutcome(trial_id=artifact.trial.id, label=artifact.trial.label, objective=objective)
             )
         summary = asdict(tracker.summary())
+
+    # Same fix as run_sweep: refresh variants from each trial's final
+    # status.json so state/objective reflect the post-wave reality, not
+    # the pending values from materialization. Runs outside the
+    # objective-tracker branch so state is also refreshed when no
+    # objective is configured.
+    _write_manifest(config, artifacts)
+    if tracker is not None:
         _update_manifest_summary(config, summary)
         if summary["best_trial_id"] is not None:
             label = tracker.best_label or summary["best_trial_id"]
@@ -695,6 +714,12 @@ def run_sweep(config: SweepConfig) -> None:
     if track_objectives and not counted_completed_missing_objectives:
         failures += _count_objective_failures(artifacts)
     failures += materialization_failures
+
+    # Refresh manifest variants from each trial's final status.json so
+    # state/objective reflect the post-run reality, not the pending
+    # values written during materialization. Optuna and multi_run_lora
+    # paths already rewrite the manifest at the end of their drivers.
+    _write_manifest(config, artifacts)
 
     if tracker is not None:
         summary = asdict(tracker.summary())
