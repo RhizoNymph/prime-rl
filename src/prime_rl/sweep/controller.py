@@ -658,11 +658,17 @@ def run_sweep(config: SweepConfig) -> None:
             raise SystemExit(1)
         return
 
-    track_objectives = config.objective is not None and isinstance(config.scheduler, LocalSweepSchedulerConfig)
+    slurm_sync = (
+        isinstance(config.scheduler, SlurmSweepSchedulerConfig) and config.scheduler.synchronous
+    )
+    track_objectives = config.objective is not None and (
+        isinstance(config.scheduler, LocalSweepSchedulerConfig) or slurm_sync
+    )
     if config.objective is not None and not track_objectives:
         print(
-            "Note: objective tracking is only computed for the local scheduler; "
-            "SLURM trials run asynchronously after submission and produce their own status.json."
+            "Note: objective tracking is only computed for the local scheduler or "
+            "synchronous SLURM scheduler; async SLURM submission produces its own "
+            "status.json without controller-side reconciliation."
         )
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if track_objectives else None
     on_trial_complete = _build_trial_callback(
@@ -707,6 +713,8 @@ def run_sweep(config: SweepConfig) -> None:
             launchable_artifacts,
             continue_on_failure=config.continue_on_failure,
             retry_budget=config.retry_budget,
+            synchronous=config.scheduler.synchronous,
+            on_trial_complete=on_trial_complete if config.scheduler.synchronous else None,
         )
     else:
         raise ValueError(f"Unsupported sweep scheduler: {config.scheduler}")

@@ -205,6 +205,76 @@ def test_slurm_submission_retries_launch_oserror(tmp_path: Path, monkeypatch) ->
     assert "failure_stage" not in status
 
 
+def test_slurm_sync_dispatches_dry_run_then_sbatch_wait(tmp_path: Path, monkeypatch) -> None:
+    """Synchronous SLURM: first call generates the script via --dry-run, second
+    call submits with sbatch --wait and blocks. Trial ends up state=completed."""
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+    script_path = artifact.run_dir / "rl.sbatch"
+
+    calls: list[list[str]] = []
+
+    def fake_run(command, env=None):
+        calls.append(list(command))
+        if "--dry-run" in command:
+            script_path.write_text("#!/usr/bin/env bash\necho hello\n")
+            return SimpleNamespace(returncode=0)
+        assert command[0] == "sbatch" and "--wait" in command
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    failures = submit_trials_to_slurm(artifacts, retry_budget=0, synchronous=True)
+
+    assert failures == 0
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
+    # Order matters: dry-run first, sbatch --wait second.
+    assert "--dry-run" in calls[0]
+    assert calls[1][0] == "sbatch" and "--wait" in calls[1]
+
+
+def test_slurm_sync_fires_on_trial_complete_callback(tmp_path: Path, monkeypatch) -> None:
+    """Synchronous SLURM with a callback halts further submissions when the
+    callback returns True (early stopping path)."""
+    _, artifacts = _materialize(tmp_path, count=3)
+    for artifact in artifacts:
+        artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_run(command, env=None):
+        if "--dry-run" in command:
+            # Find the trial's run_dir from the overrides toml in the command.
+            for arg in command:
+                p = Path(arg)
+                if p.name == "overrides.toml":
+                    run_dir = p.parent / "run"
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "rl.sbatch").write_text("#!/usr/bin/env bash\n")
+                    break
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    seen: list[str] = []
+
+    def on_trial_complete(artifact, returncode):
+        seen.append(artifact.trial.id)
+        return len(seen) >= 1  # halt after first trial
+
+    failures = submit_trials_to_slurm(
+        artifacts, retry_budget=0, synchronous=True, on_trial_complete=on_trial_complete
+    )
+
+    assert failures == 0
+    assert len(seen) == 1
+    # The other two trials must still be pending (never reached).
+    later = json.loads(artifacts[1].status_path.read_text())
+    assert later["state"] == "pending"
+
+
 def test_multi_run_lora_marks_all_artifacts_failed_on_launcher_oserror(
     tmp_path: Path, monkeypatch
 ) -> None:

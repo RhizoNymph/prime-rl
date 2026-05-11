@@ -242,6 +242,8 @@ def submit_trials_to_slurm(
     artifacts: list[TrialArtifacts],
     continue_on_failure: bool = True,
     retry_budget: int = 1,
+    synchronous: bool = False,
+    on_trial_complete: TrialCompleteCallback | None = None,
 ) -> int:
     """Submit trials through the target entrypoint's SLURM support.
 
@@ -249,7 +251,22 @@ def submit_trials_to_slurm(
     governed by the cluster's own scheduling, not this controller, so there
     is no in-flight cap here. Submission failures (not job failures) are
     retried up to ``retry_budget``.
+
+    When ``synchronous=True``, each trial is submitted via ``sbatch --wait``
+    and the controller blocks until that job exits. The trial state moves
+    pending -> running -> completed/failed, matching the local scheduler's
+    contract, so Optuna and early stopping can observe per-trial outcomes.
+    The ``on_trial_complete`` callback fires after each trial finishes and
+    can halt new submissions (used for trial-level early stopping).
     """
+    if synchronous:
+        return _submit_trials_to_slurm_sync(
+            artifacts,
+            continue_on_failure=continue_on_failure,
+            retry_budget=retry_budget,
+            on_trial_complete=on_trial_complete,
+        )
+
     failures = 0
     for artifact in artifacts:
         if _is_submitted_or_completed(artifact):
@@ -277,6 +294,101 @@ def submit_trials_to_slurm(
                 if not continue_on_failure:
                     raise SystemExit(result.returncode)
                 break
+    return failures
+
+
+SLURM_SCRIPT_FILENAME = "rl.sbatch"
+"""The rl entrypoint writes its rendered sbatch script to
+``<config.output_dir>/rl.sbatch``. The sweep dry-runs the entrypoint to
+materialize the script, then submits it directly with ``sbatch --wait``
+so the controller observes per-trial completion."""
+
+
+def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) -> int:
+    """Run one trial under SLURM, blocking until the job exits.
+
+    Two-step: (1) ``uv run rl ... --dry-run`` renders the sbatch script,
+    (2) ``sbatch --wait <script>`` submits and blocks. The retry budget
+    covers both submission and job failures; transient cluster hiccups
+    (sbatch returning non-zero, queue backpressure) get one more shot
+    before the trial is marked failed.
+    """
+    env = _build_env(artifact, gpu_group=None)
+    attempts = 0
+    while True:
+        attempts += 1
+        _reset_metrics_jsonl(artifact)
+        _write_status(
+            artifact,
+            state="running",
+            started_at=utc_now(),
+            attempts=attempts,
+            gpu_group=None,
+        )
+        try:
+            dryrun = subprocess.run(artifact.command + ["--dry-run"], env=env)
+        except OSError as exc:
+            if attempts > retry_budget:
+                _write_launch_failure_status(artifact, exc)
+                return -1
+            continue
+        if dryrun.returncode != 0:
+            if attempts > retry_budget:
+                _write_status(
+                    artifact, state="failed", finished_at=utc_now(), returncode=dryrun.returncode
+                )
+                return dryrun.returncode
+            continue
+
+        script_path = artifact.run_dir / SLURM_SCRIPT_FILENAME
+        if not script_path.exists():
+            # Should be unreachable when --dry-run returns 0, but defend so
+            # we surface a clear error rather than crash on FileNotFoundError.
+            _write_status(
+                artifact,
+                state="failed",
+                finished_at=utc_now(),
+                returncode=-1,
+                failure_stage="materialization",
+                error=f"sbatch script missing after --dry-run: {script_path}",
+            )
+            return -1
+
+        try:
+            result = subprocess.run(["sbatch", "--wait", str(script_path)], env=env)
+        except OSError as exc:
+            if attempts > retry_budget:
+                _write_launch_failure_status(artifact, exc)
+                return -1
+            continue
+        if result.returncode == 0:
+            _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
+            return 0
+        if attempts > retry_budget:
+            _write_status(
+                artifact, state="failed", finished_at=utc_now(), returncode=result.returncode
+            )
+            return result.returncode
+
+
+def _submit_trials_to_slurm_sync(
+    artifacts: list[TrialArtifacts],
+    *,
+    continue_on_failure: bool,
+    retry_budget: int,
+    on_trial_complete: TrialCompleteCallback | None = None,
+) -> int:
+    failures = 0
+    for artifact in artifacts:
+        if _is_completed(artifact):
+            continue
+        returncode = _run_with_retries_slurm_sync(artifact, retry_budget)
+        if returncode != 0:
+            failures += 1
+        if on_trial_complete is not None and on_trial_complete(artifact, returncode):
+            break
+        if returncode != 0 and not continue_on_failure:
+            break
     return failures
 
 
