@@ -4,10 +4,11 @@ import re
 
 try:
     import deep_gemm
-except ImportError:
-    deep_gemm = None  # CPU-only environments don't ship deep_gemm; FP8 paths
-    # are GPU-only at runtime, so leaving the symbol None is safe — only the
-    # autograd Function bodies below actually call into it.
+except Exception:
+    deep_gemm = None  # Environments without a CUDA toolkit either don't ship
+    # deep_gemm (ImportError) or fail its CUDA_HOME assertion at import.
+    # FP8 paths are GPU-only at runtime, so leaving the symbol None is safe —
+    # only the autograd Function bodies below actually call into it.
 import torch
 from torch import nn
 
