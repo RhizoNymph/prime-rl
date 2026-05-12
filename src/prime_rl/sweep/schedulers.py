@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from prime_rl.sweep.materialize import (
     TrialArtifacts,
@@ -363,6 +364,13 @@ def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) ->
             )
             return -1
 
+        # The dry-run prints its own "Dry run complete" message, which reads
+        # like the sweep is done — make it obvious we're now blocking on
+        # sbatch and the controller hasn't exited.
+        print(
+            f"[sweep] Submitting trial {artifact.trial.id} via 'sbatch --wait' "
+            f"({script_path}); controller will block until the job exits."
+        )
         try:
             result = subprocess.run(["sbatch", "--wait", str(script_path)], env=env)
         except OSError as exc:
@@ -611,26 +619,106 @@ def _wait_for_sacct_terminal_state(
         time.sleep(poll_interval)
 
 
-def _slurm_job_terminal_returncode(jobid: str, *, timeout_seconds: float = 60.0) -> int:
-    """Map the sacct terminal state to a POSIX-ish returncode.
+def _query_scontrol_outcome(jobid: str) -> tuple[str, int | None] | None:
+    """Query ``scontrol show job <id>`` for JobState and ExitCode.
 
-    SLURM does not expose the underlying exit code in a single canonical way
-    across configurations, so we collapse the state into 0 for COMPLETED and
-    -1 for everything else. The sweep's status.json carries enough context
-    (failure_stage, error) to distinguish causes.
+    slurmctld keeps recently-completed jobs in its in-memory cache for
+    ``MinJobAge`` seconds (default 300). This is the primary fallback when
+    sacct accounting is disabled on the cluster — sacct then returns no
+    rows and the controller would otherwise treat every job as a failure.
 
-    We poll sacct for up to ``timeout_seconds`` to avoid the common case
-    where a successful job has left the queue but its accounting record has
-    not yet been committed — a naive single-shot read returns ``None`` and
-    would mark the trial failed.
+    Returns ``(state, exit_code)`` or ``None`` when scontrol is unavailable
+    or the job has aged out of the cache. ``exit_code`` is the trial
+    process's exit code (the first half of ``ExitCode=N:M``), or ``None``
+    when the field is missing or unparseable.
     """
-    state = _wait_for_sacct_terminal_state(jobid, timeout_seconds=timeout_seconds)
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "job", jobid],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    state: str | None = None
+    exit_code: int | None = None
+    for token in (result.stdout or "").split():
+        if token.startswith("JobState="):
+            state = token.split("=", 1)[1]
+        elif token.startswith("ExitCode="):
+            raw = token.split("=", 1)[1]
+            head = raw.split(":", 1)[0]
+            try:
+                exit_code = int(head)
+            except ValueError:
+                pass
     if state is None:
-        return -1
-    head = state.split()[0]
-    if head in _SLURM_TERMINAL_STATES_OK:
-        return 0
-    return -1
+        return None
+    return state, exit_code
+
+
+def _slurm_job_terminal_outcome(
+    jobid: str,
+    *,
+    timeout_seconds: float = 60.0,
+) -> Literal["completed", "failed", "unknown"]:
+    """Determine whether a SLURM job ended in success, failure, or unknown.
+
+    Priority:
+
+    1. ``sacct`` — canonical, persistent. Requires slurmdbd accounting.
+    2. ``scontrol show job`` — in-memory slurmctld cache, works for the
+       first ``MinJobAge`` seconds (default 300) after the job exits. Used
+       on clusters where accounting is disabled.
+    3. ``unknown`` — both sources are unavailable (no slurmdbd AND the job
+       has aged out of slurmctld's cache). Callers should fall back to
+       evidence that the trial actually produced its objective.
+
+    Returning a tristate (instead of mapping unknown to "failed") is what
+    makes the controller usable on cluster setups without sacct: trial 0
+    on the user's two-node test cluster trained 20 steps cleanly and
+    logged the configured objective, but sacct returned nothing because
+    accounting was disabled, so the old code recorded it as failed and
+    discarded the objective.
+    """
+    sacct_state = _wait_for_sacct_terminal_state(jobid, timeout_seconds=timeout_seconds)
+    if sacct_state is not None:
+        head = sacct_state.split()[0]
+        if head in _SLURM_TERMINAL_STATES_OK:
+            return "completed"
+        return "failed"
+
+    scontrol = _query_scontrol_outcome(jobid)
+    if scontrol is not None:
+        state, exit_code = scontrol
+        if state in _SLURM_TERMINAL_STATES_OK:
+            # SLURM says the job completed cleanly. Trust the trial's own
+            # exit code when scontrol surfaced it; otherwise treat the
+            # COMPLETED state as authoritative.
+            if exit_code is not None and exit_code != 0:
+                return "failed"
+            return "completed"
+        if state in _SLURM_NON_TERMINAL_STATES:
+            # squeue said the job left the queue but scontrol still shows
+            # a transitional state. Treat as unknown so the caller falls
+            # back to evidence from metrics.jsonl rather than guessing.
+            return "unknown"
+        return "failed"
+
+    return "unknown"
+
+
+def _slurm_job_terminal_returncode(jobid: str, *, timeout_seconds: float = 60.0) -> int:
+    """Compatibility wrapper around the tristate outcome resolver.
+
+    Used by the prune path, where the caller already knows the job was
+    deliberately cancelled — only ``completed`` vs not matters there, so
+    folding ``unknown`` to ``-1`` is acceptable.
+    """
+    outcome = _slurm_job_terminal_outcome(jobid, timeout_seconds=timeout_seconds)
+    return 0 if outcome == "completed" else -1
 
 
 def _run_trial_with_pruning_slurm_sync(
@@ -722,6 +810,12 @@ def _run_trial_with_pruning_slurm_sync(
         )
 
     _write_status(artifact, slurm_job_id=jobid)
+    # Make the submission visible — the dry-run output above looks like the
+    # sweep is done, so without this the controller appears to hang silently.
+    print(
+        f"[sweep] Submitted trial {artifact.trial.id} as SLURM job {jobid}; "
+        f"polling metrics.jsonl every {poll_interval:.1f}s for Optuna pruning."
+    )
 
     last_reported_step: int | None = None
     reports_sent = 0
@@ -833,17 +927,60 @@ def _run_trial_with_pruning_slurm_sync(
             reports_sent=reports_sent,
         )
 
-    returncode = _slurm_job_terminal_returncode(jobid)
-    if returncode == 0:
-        objective = read_final_summary(artifact.run_dir, metric)
+    # Read the final summary unconditionally — when SLURM's terminal-state
+    # signal is unknown (sacct disabled AND scontrol cache expired), the
+    # presence of a finite objective in metrics.jsonl is our last line of
+    # evidence that the trial actually ran to completion.
+    objective = read_final_summary(artifact.run_dir, metric)
+    outcome = _slurm_job_terminal_outcome(jobid)
+
+    if outcome == "completed":
         _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
         return _PollingOutcome(
             state="completed", returncode=0, objective=objective, reports_sent=reports_sent
         )
 
-    _write_status(artifact, state="failed", finished_at=utc_now(), returncode=returncode)
+    if outcome == "failed":
+        _write_status(artifact, state="failed", finished_at=utc_now(), returncode=-1)
+        return _PollingOutcome(
+            state="failed", returncode=-1, objective=None, reports_sent=reports_sent
+        )
+
+    # outcome == "unknown": SLURM's terminal state is unrecoverable. Fall
+    # back to the metrics sidecar — a finite objective is strong evidence
+    # the trial ran to completion. Log the fallback so cluster operators
+    # see they should enable slurmdbd accounting.
+    if objective is not None:
+        print(
+            f"[sweep] WARNING: SLURM terminal state for job {jobid} is unknown "
+            "(sacct accounting disabled and scontrol cache expired). "
+            "metrics.jsonl recorded a final objective, so treating trial as "
+            "completed. Enable slurmdbd to make the signal authoritative."
+        )
+        _write_status(
+            artifact,
+            state="completed",
+            finished_at=utc_now(),
+            returncode=0,
+            slurm_terminal_state="unknown",
+        )
+        return _PollingOutcome(
+            state="completed", returncode=0, objective=objective, reports_sent=reports_sent
+        )
+
+    _write_status(
+        artifact,
+        state="failed",
+        finished_at=utc_now(),
+        returncode=-1,
+        slurm_terminal_state="unknown",
+        error=(
+            f"SLURM terminal state for job {jobid} is unknown (sacct disabled, "
+            "scontrol cache expired) and metrics.jsonl has no final objective."
+        ),
+    )
     return _PollingOutcome(
-        state="failed", returncode=returncode, objective=None, reports_sent=reports_sent
+        state="failed", returncode=-1, objective=None, reports_sent=reports_sent
     )
 
 
