@@ -685,8 +685,10 @@ def test_optuna_strategy_requires_objective(tmp_path: Path) -> None:
         )
 
 
-def test_optuna_strategy_rejects_slurm_scheduler(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="Optuna strategy is not supported with the SLURM"):
+def test_optuna_strategy_rejects_async_slurm_scheduler(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValidationError, match="Optuna strategy is not supported with the asynchronous SLURM"
+    ):
         SweepConfig(
             base=[tmp_path / "base.toml"],
             output_dir=tmp_path / "study",
@@ -695,6 +697,46 @@ def test_optuna_strategy_rejects_slurm_scheduler(tmp_path: Path) -> None:
             parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
             objective={"metric": "reward", "direction": "maximize"},
         )
+
+
+def test_optuna_strategy_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:
+    SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True},
+        strategy={"type": "optuna", "num_trials": 4},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+
+
+def test_optuna_pruner_rejects_synchronous_slurm_scheduler(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValidationError, match="Optuna pruners.*not yet supported with the synchronous SLURM"
+    ):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "synchronous": True},
+            strategy={
+                "type": "optuna",
+                "num_trials": 4,
+                "pruner": {"type": "median"},
+            },
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
+def test_early_stopping_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:
+    SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True},
+        parameters={"optim.lr": {"values": [1e-5]}},
+        objective={"metric": "val/loss", "direction": "minimize"},
+        early_stopping={"type": "patience", "patience": 3},
+    )
 
 
 def test_optuna_strategy_resume_requires_storage(tmp_path: Path) -> None:

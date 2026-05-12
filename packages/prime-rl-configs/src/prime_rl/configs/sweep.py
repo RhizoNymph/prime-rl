@@ -494,9 +494,27 @@ class SlurmSweepSchedulerConfig(BaseConfig):
     controller-managed in-flight cap will land in a later phase; until then
     there is intentionally no ``max_parallel`` knob to avoid promising
     throttling we do not enforce.
+
+    When ``synchronous = true``, the controller submits each trial via
+    ``sbatch --wait`` and blocks until that job finishes before scheduling
+    the next one. This lets Optuna and trial-level early stopping work over
+    SLURM (the controller observes each trial's objective before proposing
+    the next), at the cost of serializing trials at the controller — useful
+    when a single trial is large enough that the SLURM queue is the only
+    way to fit it but you still want adaptive search.
     """
 
     type: Literal["slurm"] = "slurm"
+    synchronous: Annotated[
+        bool,
+        Field(
+            description=(
+                "Block on each sbatch submission via 'sbatch --wait' so the "
+                "controller observes per-trial completion. Required to pair "
+                "Optuna or early stopping with the SLURM scheduler."
+            ),
+        ),
+    ] = False
 
 
 # Parameter paths a multi_run_lora sweep is allowed to vary. Must stay in
@@ -873,9 +891,14 @@ class SweepConfig(BaseConfig):
             raise ValueError(
                 "early_stopping requires an objective so the controller knows which metric to compare."
             )
-        if self.early_stopping is not None and isinstance(self.scheduler, SlurmSweepSchedulerConfig):
+        if (
+            self.early_stopping is not None
+            and isinstance(self.scheduler, SlurmSweepSchedulerConfig)
+            and not self.scheduler.synchronous
+        ):
             raise ValueError(
-                "early_stopping is not supported with the SLURM scheduler: the controller submits "
+                "early_stopping is not supported with the SLURM scheduler unless "
+                "scheduler.synchronous=true: the asynchronous SLURM scheduler submits "
                 "jobs and exits, so it never observes trial completion to decide when to halt."
             )
         if (
@@ -891,10 +914,28 @@ class SweepConfig(BaseConfig):
         if isinstance(self.strategy, OptunaStrategyConfig):
             if self.objective is None:
                 raise ValueError("Optuna strategy requires an objective to optimize.")
-            if isinstance(self.scheduler, SlurmSweepSchedulerConfig):
+            if (
+                isinstance(self.scheduler, SlurmSweepSchedulerConfig)
+                and not self.scheduler.synchronous
+            ):
                 raise ValueError(
-                    "Optuna strategy is not supported with the SLURM scheduler: the controller "
-                    "must observe each trial's objective before proposing the next one."
+                    "Optuna strategy is not supported with the asynchronous SLURM scheduler: "
+                    "the controller must observe each trial's objective before proposing the "
+                    "next one. Set scheduler.synchronous=true to submit each trial with "
+                    "'sbatch --wait' so the controller blocks per trial."
+                )
+            if (
+                isinstance(self.scheduler, SlurmSweepSchedulerConfig)
+                and self.scheduler.synchronous
+                and not isinstance(self.strategy.pruner, NoPrunerConfig)
+            ):
+                raise ValueError(
+                    "Optuna pruners (median/asha/hyperband) are not yet supported with the "
+                    "synchronous SLURM scheduler. The pruning loop polls metrics.jsonl and "
+                    "SIGTERMs the trial subprocess on prune, which would only kill the local "
+                    "'sbatch --wait' wrapper without reliably cancelling the underlying SLURM "
+                    "job. Use pruner.type='none' for now, or use a local/multi_run_lora "
+                    "scheduler if pruning is required."
                 )
             if isinstance(self.scheduler, LocalSweepSchedulerConfig) and self.scheduler.max_parallel > 1:
                 raise ValueError(

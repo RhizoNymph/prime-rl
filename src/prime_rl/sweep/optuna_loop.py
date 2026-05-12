@@ -36,6 +36,7 @@ from prime_rl.configs.sweep import (
     NoPrunerConfig,
     OptunaStrategyConfig,
     PrunerConfig,
+    SlurmSweepSchedulerConfig,
     SweepConfig,
     SweepParameterConfig,
     UniformParameterConfig,
@@ -57,6 +58,7 @@ from prime_rl.sweep.schedulers import (
     _build_env,
     _reset_metrics_jsonl,
     _run_with_retries,
+    _run_with_retries_slurm_sync,
     _write_launch_failure_status,
     _write_status,
     utc_now,
@@ -835,8 +837,15 @@ def run_optuna_sweep(
         write_manifest_with_variants(config, previous_variants + [build_variant(a) for a in artifacts])
         stop_after_trial = False
 
+        slurm_sync = (
+            isinstance(config.scheduler, SlurmSweepSchedulerConfig)
+            and config.scheduler.synchronous
+        )
         if isinstance(strategy.pruner, NoPrunerConfig):
-            returncode = _run_with_retries(artifact, gpu_group, config.retry_budget)
+            if slurm_sync:
+                returncode = _run_with_retries_slurm_sync(artifact, config.retry_budget)
+            else:
+                returncode = _run_with_retries(artifact, gpu_group, config.retry_budget)
             objective_value = (
                 read_final_summary(artifact.run_dir, config.objective.metric)
                 if returncode == 0 and config.objective is not None
