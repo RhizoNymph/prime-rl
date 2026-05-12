@@ -99,9 +99,26 @@ def _suggest_parameters(
     return suggested
 
 
-def _build_sampler(optuna: Any, strategy: OptunaStrategyConfig) -> Any:
+def _build_sampler(
+    optuna: Any,
+    strategy: OptunaStrategyConfig,
+    *,
+    concurrent_trials: int = 1,
+) -> Any:
+    """Construct the Optuna sampler, opting into ``constant_liar`` for TPE
+    when more than one trial will be in flight concurrently.
+
+    TPE estimates its density from completed trials only. Without
+    ``constant_liar``, concurrent asks see the same set of completed
+    trials and can collide on the same region of the search space; with
+    it, Optuna assigns a placeholder objective to running trials so the
+    next ask is forced to diversify. ``RandomSampler`` doesn't need this.
+    """
     if strategy.sampler == "tpe":
-        return optuna.samplers.TPESampler(seed=strategy.seed)
+        kwargs: dict[str, Any] = {"seed": strategy.seed}
+        if concurrent_trials > 1:
+            kwargs["constant_liar"] = True
+        return optuna.samplers.TPESampler(**kwargs)
     if strategy.sampler == "random":
         return optuna.samplers.RandomSampler(seed=strategy.seed)
     raise ValueError(f"Unsupported Optuna sampler: {strategy.sampler}")
@@ -150,10 +167,15 @@ def _create_study(optuna: Any, config: SweepConfig) -> Any:
     assert isinstance(strategy, OptunaStrategyConfig)
     assert config.objective is not None  # validated upstream
     direction = "maximize" if config.objective.direction == "maximize" else "minimize"
+    concurrent_trials = (
+        config.scheduler.max_parallel
+        if isinstance(config.scheduler, SlurmSweepSchedulerConfig)
+        else 1
+    )
     return optuna.create_study(
         study_name=strategy.study_name or config.name or "sweep",
         storage=strategy.storage,
-        sampler=_build_sampler(optuna, strategy),
+        sampler=_build_sampler(optuna, strategy, concurrent_trials=concurrent_trials),
         pruner=_build_pruner(optuna, strategy.pruner),
         direction=direction,
         load_if_exists=config.resume,
@@ -990,6 +1012,220 @@ def run_optuna_sweep(
 
     write_manifest_with_variants(config, previous_variants + [build_variant(a) for a in artifacts])
 
+    return failures, tracker, artifacts
+
+
+@dataclass
+class _SlurmSyncWorkerResult:
+    """Outcome of one worker thread running a SLURM-sync trial."""
+
+    returncode: int
+    objective: float | None
+
+
+def _run_one_slurm_sync_no_pruner(
+    artifact: TrialArtifacts,
+    metric: str,
+    retry_budget: int,
+) -> _SlurmSyncWorkerResult:
+    """Worker function for parallel SLURM-sync sweeps.
+
+    Synchronous SLURM with no pruner: submit with ``sbatch --wait`` (via
+    ``_run_with_retries_slurm_sync``) and read the final objective from
+    metrics.jsonl on success. Pruning is rejected upstream for parallel
+    mode because Optuna trial objects are not safe to share across
+    polling threads.
+    """
+    returncode = _run_with_retries_slurm_sync(artifact, retry_budget)
+    objective = read_final_summary(artifact.run_dir, metric) if returncode == 0 else None
+    return _SlurmSyncWorkerResult(returncode=returncode, objective=objective)
+
+
+def run_optuna_sweep_parallel_slurm(
+    config: SweepConfig,
+    write_manifest_with_variants: Any,
+    build_variant: Any,
+) -> tuple[int, TrialOutcomeTracker | None, list[TrialArtifacts]]:
+    """Drive an Optuna study with up to ``max_parallel`` concurrent SLURM jobs.
+
+    Architecture: the main thread owns the Optuna study and all ask/tell
+    interactions; a ``ThreadPoolExecutor`` with ``max_workers=max_parallel``
+    runs the per-trial ``sbatch --wait`` calls so up to N trials can be
+    in flight at once. As each future completes the main thread tells
+    Optuna the outcome and immediately asks for one more trial to refill
+    the slot, until ``num_trials`` is reached or a halt condition fires.
+
+    Halt conditions:
+    - ``tracker.observe`` returns True → stop submitting new trials, wait
+      for in-flight to finish (early stopping).
+    - ``unsafe_to_continue`` from a worker (unreachable today — only the
+      pruning runner emits it, and pruning is rejected for parallel mode —
+      but the plumbing is in place for future variants).
+    - ``not config.continue_on_failure`` after any failure → halt new
+      submissions, drain.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    optuna = _import_optuna()
+    strategy = config.strategy
+    assert isinstance(strategy, OptunaStrategyConfig)
+    assert isinstance(config.scheduler, SlurmSweepSchedulerConfig)
+    assert config.scheduler.synchronous, "parallel SLURM requires synchronous=true"
+    assert isinstance(strategy.pruner, NoPrunerConfig), "parallel SLURM rejects pruners upstream"
+    max_parallel = config.scheduler.max_parallel
+    assert max_parallel > 1
+
+    study = _create_study(optuna, config)
+    tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
+
+    previous_variants = _load_previous_variants(config) if config.resume else []
+    artifacts: list[TrialArtifacts] = []
+    failures = 0
+    if config.resume:
+        _validate_resume_manifest_coverage(study, previous_variants)
+        _validate_resume_manifest_trial_parameters(study, previous_variants)
+        _validate_resume_base_checksums(config, study, previous_variants)
+        _validate_resume_status_consistency(optuna, study, previous_variants)
+        reconciled, _ = _reconcile_running_trials(optuna, study, previous_variants)
+        if reconciled:
+            print(f"Reconciled {reconciled} RUNNING Optuna trial(s) from interrupted resume.")
+        failures = _count_optuna_failures(optuna, study)
+        if tracker is not None:
+            _seed_tracker_from_previous(tracker, previous_variants)
+        if failures > 0 and not config.continue_on_failure:
+            return failures, tracker, artifacts
+
+    already_consumed = len(study.trials) if config.resume else 0
+    next_index = already_consumed
+    halted = False
+    # Manifest writes happen on the main thread (single producer), so no
+    # lock is needed — but Optuna's in-memory study is read by the
+    # asker; ask/tell calls are all serialized by the main thread loop.
+
+    def ask_and_materialize() -> tuple[Any, TrialArtifacts | None] | None:
+        """Get the next trial from Optuna and materialize it.
+
+        Returns ``(optuna_trial, artifact)`` on success, ``(optuna_trial, None)``
+        when materialization fails (caller marks Optuna FAIL and skips), or
+        ``None`` when there are no more trials to ask for.
+        """
+        nonlocal next_index, failures
+        if halted or next_index >= strategy.num_trials:
+            return None
+        if tracker is not None and tracker.halted:
+            return None
+        index = next_index
+        next_index += 1
+        optuna_trial = study.ask()
+        params = _suggest_parameters(optuna_trial, config.parameters)
+        trial = _make_trial(index, params)
+        try:
+            artifact = materialize_trial(config, trial)
+        except Exception as exc:
+            failed_artifact = record_trial_materialization_failure(
+                config, trial, exc, finished_at=utc_now()
+            )
+            artifacts.append(failed_artifact)
+            write_manifest_with_variants(
+                config, previous_variants + [build_variant(a) for a in artifacts]
+            )
+            study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+            failures += 1
+            print(f"Optuna trial {index:04d} failed materialization: {exc}")
+            return (optuna_trial, None)
+        artifacts.append(artifact)
+        write_manifest_with_variants(
+            config, previous_variants + [build_variant(a) for a in artifacts]
+        )
+        return (optuna_trial, artifact)
+
+    with ThreadPoolExecutor(
+        max_workers=max_parallel, thread_name_prefix="slurm-sync-trial"
+    ) as executor:
+        in_flight: dict = {}
+
+        def submit_one() -> bool:
+            """Ask Optuna for one trial and submit it to the executor.
+
+            Returns True when a trial is in flight, False when there are
+            no more trials to launch (either reached ``num_trials`` or a
+            halt condition is active).
+            """
+            while True:
+                asked = ask_and_materialize()
+                if asked is None:
+                    return False
+                optuna_trial, artifact = asked
+                if artifact is None:
+                    # materialization failure already recorded; try next
+                    # index to keep the slot full.
+                    if not config.continue_on_failure:
+                        return False
+                    continue
+                future = executor.submit(
+                    _run_one_slurm_sync_no_pruner,
+                    artifact,
+                    config.objective.metric,
+                    config.retry_budget,
+                )
+                in_flight[future] = (optuna_trial, artifact)
+                return True
+
+        for _ in range(max_parallel):
+            if not submit_one():
+                break
+
+        while in_flight:
+            done, _pending = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+            for future in done:
+                optuna_trial, artifact = in_flight.pop(future)
+                trial_id = artifact.trial.id
+                trial_label_ = artifact.trial.label
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    # Worker threw — surface as failure; the only paths
+                    # that raise here are programming errors since
+                    # _run_with_retries_slurm_sync catches OSError.
+                    record_trial_objective(artifact.status_path, None)
+                    study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                    failures += 1
+                    print(f"Optuna trial {trial_id} worker raised: {exc}")
+                    if not config.continue_on_failure:
+                        halted = True
+                    continue
+
+                objective_value = result.objective
+                returncode = result.returncode
+                record_trial_objective(artifact.status_path, objective_value)
+
+                if objective_value is None:
+                    if returncode == 0:
+                        record_trial_missing_objective(artifact.status_path, config.objective.metric)
+                    study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                else:
+                    study.tell(optuna_trial, objective_value)
+
+                if returncode != 0 or objective_value is None:
+                    failures += 1
+                    if not config.continue_on_failure:
+                        halted = True
+
+                if tracker is not None:
+                    if tracker.observe(
+                        TrialOutcome(
+                            trial_id=trial_id,
+                            label=trial_label_,
+                            objective=objective_value,
+                        )
+                    ):
+                        halted = True
+
+                # Refill the freed slot unless we are halted.
+                if not halted:
+                    submit_one()
+
+    write_manifest_with_variants(config, previous_variants + [build_variant(a) for a in artifacts])
     return failures, tracker, artifacts
 
 

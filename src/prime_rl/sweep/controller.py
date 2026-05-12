@@ -33,7 +33,7 @@ from prime_rl.sweep.materialize import (
 )
 from prime_rl.sweep.metrics import coerce_finite_float, read_final_summary
 from prime_rl.sweep.multi_run import run_multi_run_optuna_sweep
-from prime_rl.sweep.optuna_loop import run_optuna_sweep
+from prime_rl.sweep.optuna_loop import run_optuna_sweep, run_optuna_sweep_parallel_slurm
 from prime_rl.sweep.reproducibility import git_metadata
 from prime_rl.sweep.schedulers import (
     run_trials_locally,
@@ -485,11 +485,24 @@ def _run_optuna(config: SweepConfig) -> None:
         )
         return
 
-    failures, tracker, artifacts = run_optuna_sweep(
-        config,
-        write_manifest_with_variants=write_manifest_with_variants,
-        build_variant=build_variant,
-    )
+    from prime_rl.configs.sweep import SlurmSweepSchedulerConfig as _SlurmCfg
+
+    if (
+        isinstance(config.scheduler, _SlurmCfg)
+        and config.scheduler.synchronous
+        and config.scheduler.max_parallel > 1
+    ):
+        failures, tracker, artifacts = run_optuna_sweep_parallel_slurm(
+            config,
+            write_manifest_with_variants=write_manifest_with_variants,
+            build_variant=build_variant,
+        )
+    else:
+        failures, tracker, artifacts = run_optuna_sweep(
+            config,
+            write_manifest_with_variants=write_manifest_with_variants,
+            build_variant=build_variant,
+        )
 
     if tracker is not None:
         summary = asdict(tracker.summary())

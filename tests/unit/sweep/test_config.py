@@ -728,6 +728,53 @@ def test_optuna_pruner_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> No
     )
 
 
+def test_slurm_max_parallel_accepts_optuna_without_pruner(tmp_path: Path) -> None:
+    """max_parallel > 1 with TPE Optuna and no pruner is the supported
+    happy path for parallel SLURM-sync sweeps."""
+    SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
+        strategy={"type": "optuna", "num_trials": 6, "sampler": "tpe"},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
+
+
+def test_slurm_max_parallel_requires_synchronous(tmp_path: Path) -> None:
+    """max_parallel > 1 without synchronous=true is incoherent — the
+    asynchronous SLURM scheduler submits jobs and exits, so it cannot
+    manage concurrent in-flight trials."""
+    with pytest.raises(ValidationError, match="max_parallel > 1 requires scheduler.synchronous=true"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "synchronous": False, "max_parallel": 2},
+            strategy={"type": "optuna", "num_trials": 6},
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
+def test_slurm_max_parallel_rejects_pruner(tmp_path: Path) -> None:
+    """Parallel SLURM-sync rejects pruners: the pruning loop owns the
+    optuna_trial object for the trial's lifetime, and Optuna trial
+    objects are not thread-safe to share across polling threads."""
+    with pytest.raises(ValidationError, match="pruners are not yet supported with SLURM max_parallel"):
+        SweepConfig(
+            base=[tmp_path / "base.toml"],
+            output_dir=tmp_path / "study",
+            scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
+            strategy={
+                "type": "optuna",
+                "num_trials": 6,
+                "pruner": {"type": "median"},
+            },
+            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+            objective={"metric": "reward", "direction": "maximize"},
+        )
+
+
 def test_early_stopping_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:
     SweepConfig(
         base=[tmp_path / "base.toml"],
@@ -764,7 +811,7 @@ def test_optuna_strategy_rejects_blank_storage(tmp_path: Path, storage: str) -> 
 
 
 def test_optuna_strategy_rejects_max_parallel_gt_one(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="Optuna strategy runs sequentially"):
+    with pytest.raises(ValidationError, match="Optuna strategy on the local scheduler runs sequentially"):
         SweepConfig(
             base=[tmp_path / "base.toml"],
             output_dir=tmp_path / "study",
