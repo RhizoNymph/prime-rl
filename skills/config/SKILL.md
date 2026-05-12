@@ -174,7 +174,7 @@ mode = "static"
 visible_devices = [[0, 1], [2, 3]]
 ```
 
-SLURM sweeps submit through each target config's existing `[slurm]` support. The default asynchronous mode exits after submission and cannot use early stopping or Optuna; set `scheduler.synchronous = true` to submit each trial with blocking SLURM behavior so early stopping, Optuna, and Optuna pruners can observe per-trial outcomes. `multi_run_lora` is RL-only and uses one shared trainer plus one orchestrator per trial; its `shared` config list describes the shared RL stack, while `base` is still the target config list used for study materialization.
+SLURM sweeps submit through each target config's existing `[slurm]` support. The default asynchronous mode exits after submission and cannot use early stopping or Optuna; set `scheduler.synchronous = true` to submit each trial with blocking SLURM behavior so early stopping, Optuna, and Optuna pruners can observe per-trial outcomes. Combine `synchronous = true` with `max_parallel > 1` to drive up to N concurrent in-flight SLURM jobs from a single Optuna study — TPE automatically opts into `constant_liar` so concurrent asks diversify; pruners are not supported under parallel SLURM. `multi_run_lora` is RL-only and uses one shared trainer plus one orchestrator per trial; its `shared` config list describes the shared RL stack, while `base` is still the target config list used for study materialization.
 
 ```toml
 [parameters."trainer.optim.lr"]

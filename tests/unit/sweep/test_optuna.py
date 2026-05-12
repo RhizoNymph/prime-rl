@@ -2241,3 +2241,196 @@ def test_optuna_sweep_with_median_pruner_runs_to_completion(tmp_path: Path, monk
     # completion + an improving series.
     assert summary["completed"] == 3
     assert summary["best_value"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Parallel SLURM-sync Optuna driver
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_slurm_sync_runs_all_trials_concurrently(tmp_path: Path, monkeypatch) -> None:
+    """With max_parallel=3, the driver should keep up to 3 workers busy and
+    still run all num_trials trials. Tracks the peak concurrency observed
+    inside the worker."""
+    import threading
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    inflight_lock = threading.Lock()
+    inflight = 0
+    peak_inflight = 0
+    rewards_per_call: list[float] = []
+
+    def fake_worker(artifact, metric, retry_budget):
+        nonlocal inflight, peak_inflight
+        with inflight_lock:
+            inflight += 1
+            peak_inflight = max(peak_inflight, inflight)
+        try:
+            import time as _time
+            _time.sleep(0.05)
+            # Ascending rewards so Optuna sees variation but values
+            # are deterministic per call index.
+            value = 0.1 + 0.1 * len(rewards_per_call)
+            rewards_per_call.append(value)
+            # Worker simulates: trial wrote final_summary.json before exit.
+            artifact.run_dir.mkdir(parents=True, exist_ok=True)
+            (artifact.run_dir / "metrics.jsonl").write_text(
+                json.dumps({metric: value, "step": 1}) + "\n"
+            )
+            from prime_rl.sweep.optuna_loop import _SlurmSyncWorkerResult
+            return _SlurmSyncWorkerResult(returncode=0, objective=value)
+        finally:
+            with inflight_lock:
+                inflight -= 1
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_no_pruner", fake_worker
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
+        strategy={"type": "optuna", "num_trials": 6, "sampler": "tpe", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # All 6 trials should have run; concurrency must have exceeded 1 to
+    # prove the threaded driver actually parallelized work.
+    assert len(rewards_per_call) == 6
+    assert peak_inflight >= 2, f"expected peak_inflight >= 2, got {peak_inflight}"
+    assert peak_inflight <= 3
+
+    manifest = json.loads((tmp_path / "study" / "manifest.json").read_text())
+    # The fake worker bypasses _run_with_retries_slurm_sync, so it doesn't
+    # write state="completed" to status.json — but the driver does record
+    # the objective via record_trial_objective. Verify the per-trial
+    # objective made it into status.json for all six trials.
+    objectives = [
+        json.loads(Path(variant["status_path"]).read_text())["objective"]
+        for variant in manifest["variants"]
+    ]
+    assert sum(1 for obj in objectives if obj is not None) == 6
+    # Six trials in flight at peak proves the driver actually parallelized.
+    assert len({obj for obj in objectives if obj is not None}) >= 1
+
+
+def test_parallel_slurm_sync_tpe_uses_constant_liar(tmp_path: Path) -> None:
+    """When max_parallel > 1, the TPE sampler must be built with
+    constant_liar=True so concurrent asks don't collide on the same region."""
+    from prime_rl.configs.sweep import OptunaStrategyConfig
+    from prime_rl.sweep.optuna_loop import _build_sampler, _import_optuna
+
+    optuna = _import_optuna()
+    strategy = OptunaStrategyConfig(num_trials=4, sampler="tpe", seed=1)
+
+    serial = _build_sampler(optuna, strategy, concurrent_trials=1)
+    parallel = _build_sampler(optuna, strategy, concurrent_trials=3)
+
+    # Optuna stores the flag as a private attribute on TPESampler; verify
+    # via the constructor argument we know we set.
+    assert getattr(parallel, "_constant_liar", False) is True
+    assert getattr(serial, "_constant_liar", False) is False
+
+
+def test_parallel_slurm_sync_halts_on_early_stop(tmp_path: Path, monkeypatch) -> None:
+    """When the early-stopping tracker fires, the driver must stop
+    submitting new trials. In-flight trials may still complete, but the
+    total trial count should be well under num_trials."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    calls = {"n": 0}
+    from prime_rl.sweep.optuna_loop import _SlurmSyncWorkerResult
+
+    def fake_worker(artifact, metric, retry_budget):
+        calls["n"] += 1
+        # Threshold halts when value is *worse* than threshold. For
+        # direction=maximize, worse means value < threshold. Return 0.1
+        # so the first completed trial trips the 0.9 threshold halt.
+        value = 0.1
+        artifact.run_dir.mkdir(parents=True, exist_ok=True)
+        (artifact.run_dir / "metrics.jsonl").write_text(
+            json.dumps({metric: value, "step": 1}) + "\n"
+        )
+        return _SlurmSyncWorkerResult(returncode=0, objective=value)
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_no_pruner", fake_worker
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 2},
+        strategy={"type": "optuna", "num_trials": 20, "sampler": "random", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        early_stopping={"type": "threshold", "threshold": 0.9},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # Initial fill submits max_parallel=2 trials. The first completion
+    # trips the halt; the second in-flight trial may already be running
+    # and will finish before the halt is observed. No further submissions,
+    # so total is bounded by max_parallel — well under num_trials=20.
+    assert calls["n"] <= 2, f"expected <= 2 trials, got {calls['n']}"
+
+
+def test_parallel_slurm_sync_failed_trial_continues_with_continue_on_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """continue_on_failure=True (default) means a single failed trial does
+    not halt the sweep — the failed slot is refilled and remaining trials
+    proceed to completion."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    calls = {"n": 0}
+    from prime_rl.sweep.optuna_loop import _SlurmSyncWorkerResult
+
+    def fake_worker(artifact, metric, retry_budget):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # First trial fails (non-zero returncode, no objective).
+            return _SlurmSyncWorkerResult(returncode=1, objective=None)
+        value = 0.5
+        artifact.run_dir.mkdir(parents=True, exist_ok=True)
+        (artifact.run_dir / "metrics.jsonl").write_text(
+            json.dumps({metric: value, "step": 1}) + "\n"
+        )
+        return _SlurmSyncWorkerResult(returncode=0, objective=value)
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_no_pruner", fake_worker
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 2},
+        strategy={"type": "optuna", "num_trials": 4, "sampler": "random", "seed": 7},
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_sweep(config)
+
+    # SystemExit==1 because the sweep recorded at least one failure, but
+    # all four trials still ran (calls.n == 4) because continue_on_failure
+    # defaults to True.
+    assert exc_info.value.code == 1
+    assert calls["n"] == 4

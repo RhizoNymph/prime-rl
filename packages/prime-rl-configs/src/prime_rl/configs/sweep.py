@@ -490,18 +490,19 @@ class LocalSweepSchedulerConfig(BaseConfig):
 class SlurmSweepSchedulerConfig(BaseConfig):
     """Submit generated trials through the target entrypoint's SLURM support.
 
-    Throughput is governed by the SLURM cluster, not this scheduler. A
-    controller-managed in-flight cap will land in a later phase; until then
-    there is intentionally no ``max_parallel`` knob to avoid promising
-    throttling we do not enforce.
+    Throughput is governed by the SLURM cluster. When ``synchronous = true``
+    the controller blocks on each trial; with ``max_parallel > 1`` the
+    controller drives up to N concurrent trials through ``sbatch
+    --parsable`` and shared-FS polling so Optuna's ask/tell loop can fill
+    the cluster instead of serializing one trial at a time.
 
     When ``synchronous = true``, the controller submits each trial via
-    ``sbatch --wait`` and blocks until that job finishes before scheduling
-    the next one. This lets Optuna and trial-level early stopping work over
-    SLURM (the controller observes each trial's objective before proposing
-    the next), at the cost of serializing trials at the controller — useful
-    when a single trial is large enough that the SLURM queue is the only
-    way to fit it but you still want adaptive search.
+    ``sbatch --wait`` (or ``sbatch --parsable`` + polling in pruning /
+    parallel mode) and observes per-trial completion. This lets Optuna and
+    trial-level early stopping work over SLURM (the controller learns each
+    trial's objective before proposing the next), at the cost of trials
+    being scheduled at the controller's pace rather than the cluster's
+    queue cadence.
     """
 
     type: Literal["slurm"] = "slurm"
@@ -515,6 +516,20 @@ class SlurmSweepSchedulerConfig(BaseConfig):
             ),
         ),
     ] = False
+    max_parallel: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Maximum concurrent in-flight SLURM jobs the controller will "
+                "manage. Only meaningful with synchronous=true; the controller "
+                "submits up to this many trials, polls each via shared-FS "
+                "metrics.jsonl + squeue, and replaces them with fresh Optuna "
+                "asks as they complete. With TPE this enables constant_liar "
+                "sampling so concurrent asks don't collide on the same region."
+            ),
+        ),
+    ] = 1
 
 
 # Parameter paths a multi_run_lora sweep is allowed to vary. Must stay in
@@ -902,6 +917,16 @@ class SweepConfig(BaseConfig):
                 "jobs and exits, so it never observes trial completion to decide when to halt."
             )
         if (
+            isinstance(self.scheduler, SlurmSweepSchedulerConfig)
+            and self.scheduler.max_parallel > 1
+            and not self.scheduler.synchronous
+        ):
+            raise ValueError(
+                "scheduler.max_parallel > 1 requires scheduler.synchronous=true: the "
+                "controller cannot manage concurrent in-flight jobs without observing each "
+                "one's terminal state, which is what the synchronous mode provides."
+            )
+        if (
             self.early_stopping is not None
             and isinstance(self.scheduler, MultiRunLoRASchedulerConfig)
             and not isinstance(self.strategy, OptunaStrategyConfig)
@@ -926,8 +951,21 @@ class SweepConfig(BaseConfig):
                 )
             if isinstance(self.scheduler, LocalSweepSchedulerConfig) and self.scheduler.max_parallel > 1:
                 raise ValueError(
-                    "Optuna strategy runs sequentially (ask/tell needs each trial's objective "
-                    "before proposing the next), so scheduler.max_parallel must be 1."
+                    "Optuna strategy on the local scheduler runs sequentially (ask/tell needs "
+                    "each trial's objective before proposing the next), so scheduler.max_parallel "
+                    "must be 1. Use scheduler.type='slurm' with synchronous=true to drive "
+                    "max_parallel > 1 over SLURM."
+                )
+            if (
+                isinstance(self.scheduler, SlurmSweepSchedulerConfig)
+                and self.scheduler.max_parallel > 1
+                and not isinstance(self.strategy.pruner, NoPrunerConfig)
+            ):
+                raise ValueError(
+                    "Optuna pruners are not yet supported with SLURM max_parallel > 1. The "
+                    "pruning loop owns the optuna_trial object for the lifetime of a single "
+                    "trial, and Optuna trial objects are not thread-safe to share across "
+                    "polling threads. Use pruner.type='none' for parallel SLURM sweeps."
                 )
             if self.resume and self.strategy.storage is None:
                 raise ValueError(
