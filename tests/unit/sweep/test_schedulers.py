@@ -447,6 +447,170 @@ def test_slurm_sync_waits_for_sacct_before_failing(tmp_path: Path, monkeypatch) 
     assert sacct_responses == []
 
 
+def test_slurm_sync_falls_back_to_scontrol_when_sacct_disabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the cluster has sacct accounting disabled, scontrol's in-memory
+    cache is the next signal. A COMPLETED+ExitCode=0:0 reading must mark
+    the trial completed and read the objective from metrics.jsonl."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="40")
+    fake_state["squeue"] = None
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 19, "val/loss": 0.74}) + "\n")
+        return 0, "40"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._query_scontrol_outcome",
+        lambda _jid: ("COMPLETED", 0),
+    )
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.74
+
+
+def test_slurm_sync_falls_back_to_metrics_when_slurm_state_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When both sacct and scontrol are silent (accounting disabled AND
+    scontrol cache aged out), the controller must trust metrics.jsonl: a
+    finite objective is strong evidence the trial ran to completion."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="40")
+    fake_state["squeue"] = None
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 19, "val/loss": 0.74}) + "\n")
+        return 0, "40"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_scontrol_outcome", lambda _jid: None)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.74
+    status = json.loads(artifact.status_path.read_text())
+    assert status["slurm_terminal_state"] == "unknown"
+
+
+def test_slurm_sync_unknown_state_with_no_objective_is_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If SLURM state is unknown and metrics.jsonl never recorded a finite
+    objective, the trial must be marked failed — no objective means we have
+    no evidence the trial actually completed its work."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="40")
+    fake_state["squeue"] = None
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_scontrol_outcome", lambda _jid: None)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+    status = json.loads(artifact.status_path.read_text())
+    assert status["slurm_terminal_state"] == "unknown"
+
+
+def test_slurm_sync_scontrol_nonzero_exit_is_failure(tmp_path: Path, monkeypatch) -> None:
+    """If scontrol reports JobState=COMPLETED but the process exit code is
+    non-zero, treat as failed — SLURM considers the allocation complete but
+    the trial itself errored."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="40")
+    fake_state["squeue"] = None
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._query_scontrol_outcome",
+        lambda _jid: ("COMPLETED", 1),
+    )
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+
+
 def test_slurm_sync_retry_wrapper_does_not_retry_unsafe_outcomes(
     tmp_path: Path, monkeypatch
 ) -> None:
