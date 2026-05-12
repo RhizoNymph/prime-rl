@@ -924,19 +924,6 @@ class SweepConfig(BaseConfig):
                     "next one. Set scheduler.synchronous=true to submit each trial with "
                     "'sbatch --wait' so the controller blocks per trial."
                 )
-            if (
-                isinstance(self.scheduler, SlurmSweepSchedulerConfig)
-                and self.scheduler.synchronous
-                and not isinstance(self.strategy.pruner, NoPrunerConfig)
-            ):
-                raise ValueError(
-                    "Optuna pruners (median/asha/hyperband) are not yet supported with the "
-                    "synchronous SLURM scheduler. The pruning loop polls metrics.jsonl and "
-                    "SIGTERMs the trial subprocess on prune, which would only kill the local "
-                    "'sbatch --wait' wrapper without reliably cancelling the underlying SLURM "
-                    "job. Use pruner.type='none' for now, or use a local/multi_run_lora "
-                    "scheduler if pruning is required."
-                )
             if isinstance(self.scheduler, LocalSweepSchedulerConfig) and self.scheduler.max_parallel > 1:
                 raise ValueError(
                     "Optuna strategy runs sequentially (ask/tell needs each trial's objective "

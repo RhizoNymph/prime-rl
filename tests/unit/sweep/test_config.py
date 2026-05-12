@@ -710,22 +710,22 @@ def test_optuna_strategy_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> 
     )
 
 
-def test_optuna_pruner_rejects_synchronous_slurm_scheduler(tmp_path: Path) -> None:
-    with pytest.raises(
-        ValidationError, match="Optuna pruners.*not yet supported with the synchronous SLURM"
-    ):
-        SweepConfig(
-            base=[tmp_path / "base.toml"],
-            output_dir=tmp_path / "study",
-            scheduler={"type": "slurm", "synchronous": True},
-            strategy={
-                "type": "optuna",
-                "num_trials": 4,
-                "pruner": {"type": "median"},
-            },
-            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
-            objective={"metric": "reward", "direction": "maximize"},
-        )
+def test_optuna_pruner_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:
+    """Median/ASHA/Hyperband pruners now work with the synchronous SLURM
+    scheduler: the controller submits with ``sbatch --parsable``, polls
+    metrics.jsonl + squeue, and ``scancel``s the job on a prune signal."""
+    SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True},
+        strategy={
+            "type": "optuna",
+            "num_trials": 4,
+            "pruner": {"type": "median"},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
 
 
 def test_early_stopping_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:

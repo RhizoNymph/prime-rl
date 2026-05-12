@@ -57,6 +57,7 @@ from prime_rl.sweep.reproducibility import file_checksum
 from prime_rl.sweep.schedulers import (
     _build_env,
     _reset_metrics_jsonl,
+    _run_trial_with_pruning_slurm_sync,
     _run_with_retries,
     _run_with_retries_slurm_sync,
     _write_launch_failure_status,
@@ -167,7 +168,16 @@ def _make_trial(index: int, parameters: dict[str, Any]) -> Trial:
 
 @dataclass
 class _PollingOutcome:
-    """Result of running a trial with intermediate-metric polling."""
+    """Result of running a trial with intermediate-metric polling.
+
+    ``unsafe_to_continue`` flags failures where the controller cannot
+    confirm the underlying job has stopped — e.g. SLURM ``squeue`` is
+    persistently unreachable, or a prune-triggered ``scancel`` did not
+    confirm the job left the queue. The outer loop must halt the sweep
+    in that case regardless of ``continue_on_failure``: launching the
+    next Optuna trial would race the still-active allocation, which is
+    worse than a noisy stop.
+    """
 
     state: Literal["completed", "pruned", "failed"]
     returncode: int
@@ -177,6 +187,7 @@ class _PollingOutcome:
     reports_sent: int = 0
     launch_error: bool = False
     launch_exception: OSError | None = None
+    unsafe_to_continue: bool = False
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes], grace_seconds: float = 10.0) -> None:
@@ -314,6 +325,48 @@ def _run_trial_with_pruning(
     return _PollingOutcome(
         state="failed", returncode=returncode, objective=None, reports_sent=reports_sent
     )
+
+
+def _run_trial_with_pruning_slurm_sync_and_retries(
+    artifact: TrialArtifacts,
+    optuna_trial: optuna.Trial,
+    metric: str,
+    poll_interval: float,
+    retry_budget: int,
+) -> _PollingOutcome:
+    """SLURM-sync analog of ``_run_trial_with_pruning_and_retries``.
+
+    Same retry contract: ``completed`` and ``pruned`` return immediately, only
+    ``failed`` outcomes are retried, and any sent reports disable retry to
+    avoid biasing the pruner across attempts.
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        outcome = _run_trial_with_pruning_slurm_sync(
+            artifact,
+            optuna_trial,
+            metric,
+            poll_interval,
+            attempt=attempts,
+        )
+        if outcome.state in ("completed", "pruned"):
+            return outcome
+        if outcome.unsafe_to_continue:
+            # The underlying SLURM job may still be alive — retrying would
+            # try to submit a second job for the same trial. Bail out so
+            # the outer loop can halt the sweep.
+            return outcome
+        if outcome.launch_error:
+            if attempts > retry_budget:
+                if outcome.launch_exception is not None:
+                    _write_launch_failure_status(artifact, outcome.launch_exception)
+                return outcome
+            continue
+        if outcome.reports_sent > 0:
+            return outcome
+        if attempts > retry_budget:
+            return outcome
 
 
 def _run_trial_with_pruning_and_retries(
@@ -774,14 +827,21 @@ def run_optuna_sweep(
     optuna = _import_optuna()
     strategy = config.strategy
     assert isinstance(strategy, OptunaStrategyConfig)
-    assert isinstance(config.scheduler, LocalSweepSchedulerConfig)  # rejected upstream otherwise
+    # Local and synchronous-SLURM schedulers are both supported. Asynchronous
+    # SLURM and multi_run_lora are rejected upstream by the SweepConfig validator.
+    assert isinstance(config.scheduler, (LocalSweepSchedulerConfig, SlurmSweepSchedulerConfig))
 
     study = _create_study(optuna, config)
 
-    gpu_groups = (
-        config.scheduler.gpu_assignment.visible_devices if config.scheduler.gpu_assignment is not None else None
-    )
-    gpu_group = gpu_groups[0] if gpu_groups else None
+    if isinstance(config.scheduler, LocalSweepSchedulerConfig):
+        gpu_groups = (
+            config.scheduler.gpu_assignment.visible_devices
+            if config.scheduler.gpu_assignment is not None
+            else None
+        )
+        gpu_group = gpu_groups[0] if gpu_groups else None
+    else:
+        gpu_group = None
 
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
 
@@ -870,14 +930,23 @@ def run_optuna_sweep(
                 if not config.continue_on_failure:
                     stop_after_trial = True
         else:
-            outcome = _run_trial_with_pruning_and_retries(
-                artifact,
-                gpu_group,
-                optuna_trial,
-                config.objective.metric,
-                strategy.poll_interval_seconds,
-                config.retry_budget,
-            )
+            if slurm_sync:
+                outcome = _run_trial_with_pruning_slurm_sync_and_retries(
+                    artifact,
+                    optuna_trial,
+                    config.objective.metric,
+                    strategy.poll_interval_seconds,
+                    config.retry_budget,
+                )
+            else:
+                outcome = _run_trial_with_pruning_and_retries(
+                    artifact,
+                    gpu_group,
+                    optuna_trial,
+                    config.objective.metric,
+                    strategy.poll_interval_seconds,
+                    config.retry_budget,
+                )
             objective_value = outcome.objective
             if outcome.state == "completed":
                 record_trial_objective(artifact.status_path, objective_value)
@@ -900,7 +969,12 @@ def run_optuna_sweep(
                 record_trial_objective(artifact.status_path, None)
                 study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
                 failures += 1
-                if not config.continue_on_failure:
+                if not config.continue_on_failure or outcome.unsafe_to_continue:
+                    # ``unsafe_to_continue`` forces a halt even when the user
+                    # set ``continue_on_failure=True``: the underlying SLURM
+                    # job may still be running (persistent squeue failure or
+                    # unconfirmed scancel), and submitting the next trial
+                    # would race the still-active allocation.
                     stop_after_trial = True
 
         if tracker is not None:

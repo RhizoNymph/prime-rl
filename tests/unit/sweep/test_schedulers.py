@@ -211,7 +211,10 @@ def test_slurm_sync_dispatches_dry_run_then_sbatch_wait(tmp_path: Path, monkeypa
     _, artifacts = _materialize(tmp_path, count=1)
     artifact = artifacts[0]
     artifact.run_dir.mkdir(parents=True, exist_ok=True)
-    script_path = artifact.run_dir / "rl.sbatch"
+    # _materialize uses entrypoint="sft" — the dry-run writes sft.sbatch, not
+    # rl.sbatch. This test locks in that the runner derives the filename from
+    # the trial's command rather than hard-coding the rl entrypoint.
+    script_path = artifact.run_dir / "sft.sbatch"
 
     calls: list[list[str]] = []
 
@@ -221,6 +224,7 @@ def test_slurm_sync_dispatches_dry_run_then_sbatch_wait(tmp_path: Path, monkeypa
             script_path.write_text("#!/usr/bin/env bash\necho hello\n")
             return SimpleNamespace(returncode=0)
         assert command[0] == "sbatch" and "--wait" in command
+        assert str(script_path) in command
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
@@ -245,13 +249,13 @@ def test_slurm_sync_fires_on_trial_complete_callback(tmp_path: Path, monkeypatch
 
     def fake_run(command, env=None):
         if "--dry-run" in command:
-            # Find the trial's run_dir from the overrides toml in the command.
+            entrypoint = command[2]
             for arg in command:
                 p = Path(arg)
                 if p.name == "overrides.toml":
                     run_dir = p.parent / "run"
                     run_dir.mkdir(parents=True, exist_ok=True)
-                    (run_dir / "rl.sbatch").write_text("#!/usr/bin/env bash\n")
+                    (run_dir / f"{entrypoint}.sbatch").write_text("#!/usr/bin/env bash\n")
                     break
             return SimpleNamespace(returncode=0)
         return SimpleNamespace(returncode=0)
@@ -273,6 +277,376 @@ def test_slurm_sync_fires_on_trial_complete_callback(tmp_path: Path, monkeypatch
     # The other two trials must still be pending (never reached).
     later = json.loads(artifacts[1].status_path.read_text())
     assert later["state"] == "pending"
+
+
+def _setup_slurm_sync_fakes(monkeypatch, *, jobid: str, terminal_state: str = "COMPLETED") -> dict:
+    """Patch every external SLURM call used by ``_run_trial_with_pruning_slurm_sync``.
+
+    Returns a state dict the test can poke to advance the fake job lifecycle.
+    ``_query_squeue_state`` returns ``state['squeue']`` (start "RUNNING"; tests
+    flip to ``None`` to signal job exit), ``_query_sacct_state`` returns the
+    terminal state, ``_submit_sbatch_parsable`` returns the provided ``jobid``.
+    """
+    state = {"squeue": "RUNNING", "scancelled": False}
+
+    def fake_render(artifact, env):
+        entrypoint = artifact.command[2]
+        (artifact.run_dir / f"{entrypoint}.sbatch").write_text("#!/usr/bin/env bash\n")
+        return 0
+
+    def fake_submit(_script, _env):
+        return 0, jobid
+
+    def fake_squeue(_jid):
+        return state["squeue"]
+
+    def fake_sacct(_jid):
+        return terminal_state
+
+    def fake_scancel(_jid, **_kwargs):
+        state["scancelled"] = True
+        state["squeue"] = None
+        return True
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._render_sbatch_script", fake_render)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_squeue_state", fake_squeue)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", fake_sacct)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._scancel_job", fake_scancel)
+    monkeypatch.setattr("prime_rl.sweep.schedulers.time.sleep", lambda _s: None)
+    return state
+
+
+def test_slurm_sync_pruning_writes_jobid_and_completes(tmp_path: Path, monkeypatch) -> None:
+    """Happy path: trial completes, controller records objective from
+    metrics.jsonl, status reflects ``slurm_job_id`` + state=completed."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="42")
+    # Job already exited before the controller polled (squeue returns None).
+    fake_state["squeue"] = None
+
+    # The fake submitter writes the metrics file the controller will read —
+    # i.e. the real trial wrote metrics.jsonl during its run.
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 10, "val/loss": 0.5}) + "\n")
+        return 0, "42"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+
+    class _Trial:
+        def report(self, value, step):
+            pass
+
+        def should_prune(self):
+            return True
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.returncode == 0
+    assert outcome.objective == 0.5
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["slurm_job_id"] == "42"
+
+
+def test_slurm_sync_pruning_scancels_on_prune(tmp_path: Path, monkeypatch) -> None:
+    """Prune path: should_prune() triggers ``scancel``, status=pruned, and
+    the pruned step/value are recorded from the most recent metrics row."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="99", terminal_state="CANCELLED")
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 5, "val/loss": 1.7}) + "\n")
+        return 0, "99"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+
+    class _Trial:
+        def __init__(self):
+            self.reported = []
+
+        def report(self, value, step):
+            self.reported.append((step, value))
+
+        def should_prune(self):
+            return True
+
+    trial = _Trial()
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, trial, metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "pruned"
+    assert outcome.pruned_at_step == 5
+    assert outcome.pruned_value == 1.7
+    assert fake_state["scancelled"] is True
+    assert trial.reported == [(5, 1.7)]
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "pruned"
+    assert status["slurm_job_id"] == "99"
+
+
+def test_slurm_sync_waits_for_sacct_before_failing(tmp_path: Path, monkeypatch) -> None:
+    """sacct can lag after squeue clears; the controller must poll a bit
+    before declaring the trial failed, otherwise a COMPLETED job is reported
+    to Optuna as FAIL whenever the accounting db is congested."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="77", terminal_state="COMPLETED")
+    fake_state["squeue"] = None
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 1, "val/loss": 0.25}) + "\n")
+        return 0, "77"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+
+    sacct_responses = [None, None, "COMPLETED"]
+
+    def lagging_sacct(_jid):
+        return sacct_responses.pop(0) if sacct_responses else "COMPLETED"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lagging_sacct)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.returncode == 0
+    assert outcome.objective == 0.25
+    # All three lagged responses were consumed (two Nones + the terminal).
+    assert sacct_responses == []
+
+
+def test_slurm_sync_retry_wrapper_does_not_retry_unsafe_outcomes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The retry wrapper must short-circuit on unsafe_to_continue outcomes:
+    re-running would submit a second SLURM job for the same trial while the
+    first may still be alive."""
+    from prime_rl.sweep import optuna_loop as opt
+    from prime_rl.sweep.optuna_loop import _PollingOutcome, _run_trial_with_pruning_slurm_sync_and_retries
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+
+    attempts: list[int] = []
+
+    def fake_runner(_artifact, _trial, _metric, _poll_interval, attempt: int = 1):
+        attempts.append(attempt)
+        return _PollingOutcome(
+            state="failed",
+            returncode=-1,
+            objective=None,
+            unsafe_to_continue=True,
+        )
+
+    monkeypatch.setattr(opt, "_run_trial_with_pruning_slurm_sync", fake_runner)
+
+    outcome = _run_trial_with_pruning_slurm_sync_and_retries(
+        artifact,
+        optuna_trial=object(),
+        metric="val/loss",
+        poll_interval=0.01,
+        retry_budget=5,  # large budget — must still short-circuit
+    )
+
+    assert outcome.unsafe_to_continue is True
+    assert attempts == [1]
+
+
+def test_slurm_sync_marks_failed_when_scancel_unconfirmed(tmp_path: Path, monkeypatch) -> None:
+    """If _scancel_job returns False (job did not leave the queue), the trial
+    must be recorded as failed — never as pruned — so the controller does not
+    advance Optuna while the SLURM allocation is still active."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="123")
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 1, "val/loss": 0.5}) + "\n")
+        return 0, "123"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+    # scancel returns False — couldn't confirm the job left the queue.
+    monkeypatch.setattr("prime_rl.sweep.schedulers._scancel_job", lambda _jid, **_kwargs: False)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return True
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.returncode == -1
+    # unsafe_to_continue forces the outer loop to halt regardless of
+    # continue_on_failure — the SLURM job may still be alive.
+    assert outcome.unsafe_to_continue is True
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["failure_stage"] == "scancel"
+    assert "123" in status["error"]
+    # Critically: state is NOT "pruned" — the controller cannot assume the
+    # job is gone, so advancing the Optuna study is unsafe.
+    assert fake_state["squeue"] == "RUNNING"  # job state untouched by fake
+
+
+def test_slurm_sync_hard_fails_after_repeated_squeue_errors(tmp_path: Path, monkeypatch) -> None:
+    """When ``squeue`` returns errors back-to-back, the polling loop must NOT
+    treat the silence as "job is done" — it must hard-fail the trial so the
+    controller does not advance the Optuna study while the SLURM job may
+    still be running."""
+    from prime_rl.sweep.schedulers import SqueueQueryError, _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    _setup_slurm_sync_fakes(monkeypatch, jobid="55")
+
+    def always_failing_squeue(_jid):
+        raise SqueueQueryError("slurmctld unreachable")
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_squeue_state", always_failing_squeue)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.unsafe_to_continue is True
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["failure_stage"] == "squeue"
+
+
+def test_slurm_sync_tolerates_transient_squeue_failure(tmp_path: Path, monkeypatch) -> None:
+    """A single transient squeue failure must not break the polling loop —
+    the controller should retry, observe the running job, and continue until
+    the job legitimately leaves the queue."""
+    from prime_rl.sweep.schedulers import SqueueQueryError, _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    _setup_slurm_sync_fakes(monkeypatch, jobid="66", terminal_state="COMPLETED")
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 2, "val/loss": 0.4}) + "\n")
+        return 0, "66"
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics)
+
+    # First call: transient failure. Second: still running. Third: gone.
+    squeue_script = [SqueueQueryError("temp glitch"), "RUNNING", None]
+
+    def flaky_squeue(_jid):
+        response = squeue_script.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_squeue_state", flaky_squeue)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.4
+    assert squeue_script == []
+
+
+def test_slurm_sync_pruning_marks_failed_on_submit_error(tmp_path: Path, monkeypatch) -> None:
+    """If sbatch --parsable returns no job id, the trial is marked failed
+    with failure_stage=submission so resume can see what went wrong."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_render(a, _env):
+        entrypoint = a.command[2]
+        (a.run_dir / f"{entrypoint}.sbatch").write_text("#!/usr/bin/env bash\n")
+        return 0
+
+    def fake_submit(_script, _env):
+        return 1, None
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers._render_sbatch_script", fake_render)
+    monkeypatch.setattr("prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit)
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "failed"
+    assert status["failure_stage"] == "submission"
 
 
 def test_multi_run_lora_marks_all_artifacts_failed_on_launcher_oserror(
