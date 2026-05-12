@@ -392,5 +392,13 @@ else
         -m prime_rl.trainer.rl.train \
         @ $CONFIG_DIR/trainer.toml \
         2>&1 | sed -u 's/^\[[a-zA-Z]*[0-9]*\]://' | tee -a $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log
-{% if num_infer_nodes > 0 %}    fi{% endif %}
+
+{% if num_infer_nodes > 0 %}    # Trainer is done. Cancel the SLURM allocation so the inference task
+    # (which holds the allocation indefinitely via `uv run inference`) shuts
+    # down too. Without this, every multi-node RL job hangs until manually
+    # scancel-ed, which is fatal for sweeps that submit many trials back-to-back.
+    if [ "$TRAIN_NODE_RANK" -eq 0 ]; then
+        scancel "$SLURM_JOB_ID"
+    fi
+    fi{% endif %}
 '
