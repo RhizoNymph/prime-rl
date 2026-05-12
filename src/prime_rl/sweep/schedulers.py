@@ -363,6 +363,13 @@ def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) ->
             )
             return -1
 
+        # The dry-run prints its own "Dry run complete" message, which reads
+        # like the sweep is done — make it obvious we're now blocking on
+        # sbatch and the controller hasn't exited.
+        print(
+            f"[sweep] Submitting trial {artifact.trial.id} via 'sbatch --wait' "
+            f"({script_path}); controller will block until the job exits."
+        )
         try:
             result = subprocess.run(["sbatch", "--wait", str(script_path)], env=env)
         except OSError as exc:
@@ -722,6 +729,12 @@ def _run_trial_with_pruning_slurm_sync(
         )
 
     _write_status(artifact, slurm_job_id=jobid)
+    # Make the submission visible — the dry-run output above looks like the
+    # sweep is done, so without this the controller appears to hang silently.
+    print(
+        f"[sweep] Submitted trial {artifact.trial.id} as SLURM job {jobid}; "
+        f"polling metrics.jsonl every {poll_interval:.1f}s for Optuna pruning."
+    )
 
     last_reported_step: int | None = None
     reports_sent = 0
