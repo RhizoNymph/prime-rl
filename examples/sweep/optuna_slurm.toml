@@ -12,8 +12,8 @@
 # For embarrassingly parallel grid/random sweeps with a stable queue,
 # stick with the default (synchronous = false).
 #
-# Optuna pruners (median/asha/hyperband) are not yet supported with this
-# scheduler — see the validator error message for details.
+# Pruners are supported on this scheduler — see
+# examples/sweep/optuna_pruner_slurm.toml for a pruning variant.
 #
 # Run:
 #   uv run sweep @ examples/sweep/optuna_slurm.toml

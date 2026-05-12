@@ -160,7 +160,7 @@ metric = "reward/reverse-text/mean"
 direction = "maximize"
 ```
 
-Use `strategy.type = "grid"` for exhaustive choice combinations, `random` for seeded independent samples, and `optuna` for adaptive ask/tell studies. Optuna requires the `hpo` extra (`uv sync --extra hpo`), an `[objective]`, and local or `multi_run_lora` scheduling. Persistent Optuna resume requires `strategy.storage`, usually a SQLite URL such as `sqlite:///outputs/studies/name/optuna.db`.
+Use `strategy.type = "grid"` for exhaustive choice combinations, `random` for seeded independent samples, and `optuna` for adaptive ask/tell studies. Optuna requires the `hpo` extra (`uv sync --extra hpo`), an `[objective]`, and local, synchronous SLURM, or `multi_run_lora` scheduling. Persistent Optuna resume requires `strategy.storage`, usually a SQLite URL such as `sqlite:///outputs/studies/name/optuna.db`.
 
 Schedulers are `local`, `slurm`, and `multi_run_lora`. Local parallel sweeps require explicit disjoint GPU groups:
 
@@ -174,7 +174,7 @@ mode = "static"
 visible_devices = [[0, 1], [2, 3]]
 ```
 
-SLURM sweeps submit through each target config's existing `[slurm]` support and exit after submission, so they cannot use early stopping or Optuna. `multi_run_lora` is RL-only and uses one shared trainer plus one orchestrator per trial; its `shared` config list describes the shared RL stack, while `base` is still the target config list used for study materialization.
+SLURM sweeps submit through each target config's existing `[slurm]` support. The default asynchronous mode exits after submission and cannot use early stopping or Optuna; set `scheduler.synchronous = true` to submit each trial with blocking SLURM behavior so early stopping, Optuna, and Optuna pruners can observe per-trial outcomes. `multi_run_lora` is RL-only and uses one shared trainer plus one orchestrator per trial; its `shared` config list describes the shared RL stack, while `base` is still the target config list used for study materialization.
 
 ```toml
 [parameters."trainer.optim.lr"]

@@ -2,6 +2,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -10,9 +11,11 @@ from pathlib import Path
 from prime_rl.sweep.materialize import (
     TrialArtifacts,
     read_status_json,
+    record_trial_pruned,
     write_json,
     write_multi_run_output_override,
 )
+from prime_rl.sweep.metrics import read_final_summary, read_intermediate_metric
 from prime_rl.utils.monitor import SWEEP_METRICS_JSONL_ENV
 
 TrialCompleteCallback = Callable[[TrialArtifacts, int], bool]
@@ -297,11 +300,17 @@ def submit_trials_to_slurm(
     return failures
 
 
-SLURM_SCRIPT_FILENAME = "rl.sbatch"
-"""The rl entrypoint writes its rendered sbatch script to
-``<config.output_dir>/rl.sbatch``. The sweep dry-runs the entrypoint to
-materialize the script, then submits it directly with ``sbatch --wait``
-so the controller observes per-trial completion."""
+def _slurm_script_path(artifact: TrialArtifacts) -> Path:
+    """Return the sbatch script the entrypoint's ``--dry-run`` materializes.
+
+    Each entrypoint writes ``<run_dir>/<entrypoint>.sbatch`` (``rl.sbatch``,
+    ``sft.sbatch``), not a fixed filename — so the synchronous SLURM path
+    must derive the script name from the trial's command rather than
+    hard-coding ``rl.sbatch``. ``artifact.command`` is shaped as
+    ``["uv", "run", "<entrypoint>", ...]``.
+    """
+    entrypoint = artifact.command[2]
+    return artifact.run_dir / f"{entrypoint}.sbatch"
 
 
 def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) -> int:
@@ -340,7 +349,7 @@ def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) ->
                 return dryrun.returncode
             continue
 
-        script_path = artifact.run_dir / SLURM_SCRIPT_FILENAME
+        script_path = _slurm_script_path(artifact)
         if not script_path.exists():
             # Should be unreachable when --dry-run returns 0, but defend so
             # we surface a clear error rather than crash on FileNotFoundError.
@@ -390,6 +399,452 @@ def _submit_trials_to_slurm_sync(
         if returncode != 0 and not continue_on_failure:
             break
     return failures
+
+
+_SLURM_TERMINAL_STATES_OK = {"COMPLETED"}
+_SLURM_TERMINAL_STATES_BAD = {
+    "FAILED",
+    "TIMEOUT",
+    "OUT_OF_MEMORY",
+    "NODE_FAIL",
+    "BOOT_FAIL",
+    "DEADLINE",
+    "PREEMPTED",
+    "REVOKED",
+}
+_SLURM_TERMINAL_STATES_CANCELLED = {"CANCELLED"}
+
+
+def _render_sbatch_script(artifact: TrialArtifacts, env: dict[str, str]) -> int:
+    """Run ``<entrypoint> --dry-run`` to materialize the sbatch script.
+
+    Returns the dry-run returncode. The caller is responsible for writing the
+    status row on failure; we keep this helper pure so it can be reused by the
+    non-pruning and pruning SLURM-sync paths.
+    """
+    try:
+        result = subprocess.run(artifact.command + ["--dry-run"], env=env)
+    except OSError as exc:
+        raise exc
+    return result.returncode
+
+
+def _submit_sbatch_parsable(script_path: Path, env: dict[str, str]) -> tuple[int, str | None]:
+    """Submit a script with ``sbatch --parsable``; return ``(returncode, jobid)``.
+
+    ``--parsable`` writes only the job id (optionally ``jobid;cluster``) to
+    stdout, which lets us track the job without scraping the human-readable
+    ``Submitted batch job <id>`` line. Returns ``jobid=None`` when stdout is
+    empty or sbatch exits non-zero — the caller decides whether to retry.
+    """
+    try:
+        result = subprocess.run(
+            ["sbatch", "--parsable", str(script_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        raise
+    if result.returncode != 0:
+        return result.returncode, None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return result.returncode, None
+    jobid = raw.split(";", 1)[0].strip() or None
+    return result.returncode, jobid
+
+
+class SqueueQueryError(RuntimeError):
+    """Raised when ``squeue`` cannot be reached or returns an unrecognized error.
+
+    Distinguished from "job not in queue" (which the caller treats as
+    terminal): a transient query failure must NOT be silently mapped to
+    "job is gone", or the controller would break out of its polling loop
+    while the SLURM job is still running.
+    """
+
+
+_SQUEUE_NOT_FOUND_PATTERNS = (
+    "invalid job id",
+    "invalid jobid",
+    "no such job",
+    "job not found",
+)
+
+
+def _query_squeue_state(jobid: str) -> str | None:
+    """Return the SLURM state of ``jobid`` via ``squeue``, or ``None`` if the
+    job is not in the active queue.
+
+    Raises ``SqueueQueryError`` when the query itself fails — missing binary,
+    munge/auth error, slurmctld unreachable, or any non-"invalid job id"
+    stderr. Distinguishing query failure from "job is gone" is essential:
+    silently collapsing them would let a transient ``squeue`` outage break
+    the controller's polling loop while the job is still running, after
+    which the controller would advance to the next Optuna trial and contend
+    for the still-active allocation.
+    """
+    try:
+        result = subprocess.run(
+            ["squeue", "-h", "-j", jobid, "-o", "%T"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise SqueueQueryError(f"squeue invocation failed: {exc}") from exc
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 0:
+        return stdout or None
+    # Non-zero: older SLURM versions return non-zero for "job not found" while
+    # newer versions return 0 with empty stdout. Treat the "job not found"
+    # error string as terminal; anything else is a query failure to retry.
+    stderr_lower = stderr.lower()
+    if any(pattern in stderr_lower for pattern in _SQUEUE_NOT_FOUND_PATTERNS):
+        return None
+    raise SqueueQueryError(
+        f"squeue returned rc={result.returncode}, stderr={stderr!r}"
+    )
+
+
+def _query_sacct_state(jobid: str) -> str | None:
+    """Return the terminal state of ``jobid`` via ``sacct``, or ``None``.
+
+    The first line of ``sacct -j <id> -n -P -o State`` is the batch step's
+    state. Returns ``None`` when sacct produces no output or is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["sacct", "-j", jobid, "-n", "-P", "-o", "State"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        token = line.strip().split()[0] if line.strip() else ""
+        if token:
+            return token
+    return None
+
+
+def _scancel_job(jobid: str, *, grace_seconds: float = 30.0, poll_interval: float = 1.0) -> bool:
+    """Cancel a SLURM job and confirm it has left the queue.
+
+    Returns ``True`` only when ``squeue`` reports the job is no longer in
+    the queue within ``grace_seconds``. Returns ``False`` otherwise — the
+    scancel binary was unavailable, scancel returned non-zero, squeue
+    queries kept failing, or the job stayed in the queue past the deadline.
+
+    Callers MUST treat ``False`` as "cancellation NOT confirmed": the SLURM
+    job may still be running, so advancing the sweep would race the next
+    trial against the still-active allocation. Record the trial as failed
+    in that case, not pruned.
+    """
+    try:
+        subprocess.run(["scancel", jobid], capture_output=True)
+    except OSError:
+        # Fall through to the wait loop: maybe an earlier scancel by another
+        # tenant is in flight and the job will still leave the queue.
+        pass
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            state = _query_squeue_state(jobid)
+        except SqueueQueryError:
+            # Can't tell whether the job left — keep polling until the
+            # deadline rather than declaring success.
+            time.sleep(poll_interval)
+            continue
+        if state is None:
+            return True
+        time.sleep(poll_interval)
+
+    return False
+
+
+_SLURM_NON_TERMINAL_STATES = {
+    "PENDING",
+    "RUNNING",
+    "REQUEUED",
+    "RESIZING",
+    "SUSPENDED",
+    "CONFIGURING",
+    "COMPLETING",
+}
+
+
+def _wait_for_sacct_terminal_state(
+    jobid: str,
+    *,
+    timeout_seconds: float = 60.0,
+    poll_interval: float = 2.0,
+) -> str | None:
+    """Poll sacct until it reports a terminal state (or the budget is spent).
+
+    The job already left ``squeue`` so we know it has finished. However sacct
+    can lag by several seconds while the accounting daemon catches up on most
+    real clusters (and longer when the DB is congested) — without a backoff
+    we would record a COMPLETED job as failed simply because we asked too
+    soon. ``None`` results are also retried since an empty sacct response is
+    indistinguishable from "not committed yet."
+
+    Returns the observed terminal state, or ``None`` if the timeout elapses
+    before any terminal state shows up. ``CANCELLED`` is treated as terminal
+    here: it is the state we expect after a prune-driven ``scancel``.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last_state: str | None = None
+    while True:
+        state = _query_sacct_state(jobid)
+        if state is not None:
+            head = state.split()[0]
+            if head not in _SLURM_NON_TERMINAL_STATES:
+                return state
+            last_state = state
+        if time.monotonic() >= deadline:
+            return last_state
+        time.sleep(poll_interval)
+
+
+def _slurm_job_terminal_returncode(jobid: str, *, timeout_seconds: float = 60.0) -> int:
+    """Map the sacct terminal state to a POSIX-ish returncode.
+
+    SLURM does not expose the underlying exit code in a single canonical way
+    across configurations, so we collapse the state into 0 for COMPLETED and
+    -1 for everything else. The sweep's status.json carries enough context
+    (failure_stage, error) to distinguish causes.
+
+    We poll sacct for up to ``timeout_seconds`` to avoid the common case
+    where a successful job has left the queue but its accounting record has
+    not yet been committed — a naive single-shot read returns ``None`` and
+    would mark the trial failed.
+    """
+    state = _wait_for_sacct_terminal_state(jobid, timeout_seconds=timeout_seconds)
+    if state is None:
+        return -1
+    head = state.split()[0]
+    if head in _SLURM_TERMINAL_STATES_OK:
+        return 0
+    return -1
+
+
+def _run_trial_with_pruning_slurm_sync(
+    artifact: TrialArtifacts,
+    optuna_trial,  # type: ignore[no-untyped-def]
+    metric: str,
+    poll_interval: float,
+    attempt: int = 1,
+):
+    """Submit a SLURM job for one trial and poll metrics for Optuna pruning.
+
+    Mirrors the local ``_run_trial_with_pruning`` contract:
+
+    - Each new ``(step, value)`` in the shared-FS ``metrics.jsonl`` is forwarded
+      to ``optuna_trial.report``; ``should_prune()`` is checked after every new
+      report.
+    - On a prune signal we ``scancel`` the underlying SLURM job (which kills
+      every step process on the compute node, the equivalent of SIGTERM-ing
+      the local process group).
+    - On natural completion the final objective is read from the same sidecar
+      so the sampler sees the value the rest of the sweep records.
+
+    Requires a shared filesystem between the controller and the compute node
+    so ``metrics.jsonl`` is visible to both — SLURM-sync sweeps already assume
+    this for status/manifest reads.
+    """
+    # Lazy import to keep this file importable without optuna installed.
+    from prime_rl.sweep.optuna_loop import _PollingOutcome
+
+    env = _build_env(artifact, gpu_group=None)
+    _reset_metrics_jsonl(artifact)
+    _write_status(
+        artifact,
+        state="running",
+        started_at=utc_now(),
+        attempts=attempt,
+        gpu_group=None,
+    )
+
+    try:
+        dryrun_rc = _render_sbatch_script(artifact, env)
+    except OSError as exc:
+        return _PollingOutcome(
+            state="failed",
+            returncode=-1,
+            objective=None,
+            launch_error=True,
+            launch_exception=exc,
+        )
+    if dryrun_rc != 0:
+        _write_status(artifact, state="failed", finished_at=utc_now(), returncode=dryrun_rc)
+        return _PollingOutcome(state="failed", returncode=dryrun_rc, objective=None)
+
+    script_path = _slurm_script_path(artifact)
+    if not script_path.exists():
+        _write_status(
+            artifact,
+            state="failed",
+            finished_at=utc_now(),
+            returncode=-1,
+            failure_stage="materialization",
+            error=f"sbatch script missing after --dry-run: {script_path}",
+        )
+        return _PollingOutcome(state="failed", returncode=-1, objective=None)
+
+    try:
+        submit_rc, jobid = _submit_sbatch_parsable(script_path, env)
+    except OSError as exc:
+        return _PollingOutcome(
+            state="failed",
+            returncode=-1,
+            objective=None,
+            launch_error=True,
+            launch_exception=exc,
+        )
+    if submit_rc != 0 or jobid is None:
+        _write_status(
+            artifact,
+            state="failed",
+            finished_at=utc_now(),
+            returncode=submit_rc if submit_rc != 0 else -1,
+            failure_stage="submission",
+            error=f"sbatch --parsable failed: rc={submit_rc}, jobid={jobid!r}",
+        )
+        return _PollingOutcome(
+            state="failed",
+            returncode=submit_rc if submit_rc != 0 else -1,
+            objective=None,
+        )
+
+    _write_status(artifact, slurm_job_id=jobid)
+
+    last_reported_step: int | None = None
+    reports_sent = 0
+    pruned = False
+    prune_step: int | None = None
+    prune_value: float | None = None
+    consecutive_squeue_failures = 0
+    # Three consecutive squeue failures over poll_interval cadence give a
+    # short tolerance for transient cluster hiccups (controller restart,
+    # brief slurmctld unavailability) without letting a persistently broken
+    # queue silently terminate the polling loop.
+    max_squeue_failures = 3
+
+    while True:
+        sample = read_intermediate_metric(artifact.run_dir, metric)
+        report_just_sent = False
+        if sample is not None:
+            step, value = sample
+            if last_reported_step is None or step > last_reported_step:
+                optuna_trial.report(value, step)
+                last_reported_step = step
+                reports_sent += 1
+                report_just_sent = True
+                prune_step = step
+                prune_value = value
+
+        try:
+            state = _query_squeue_state(jobid)
+        except SqueueQueryError as exc:
+            consecutive_squeue_failures += 1
+            if consecutive_squeue_failures >= max_squeue_failures:
+                # We can't see the queue, so we don't know whether the job
+                # is still alive. Mark the trial unsafe-to-continue: the
+                # outer loop must halt the sweep regardless of
+                # continue_on_failure, because submitting the next Optuna
+                # trial would race the possibly-still-running allocation.
+                # Resume can pick the job back up via the recorded
+                # slurm_job_id once the cluster is healthy.
+                _write_status(
+                    artifact,
+                    state="failed",
+                    finished_at=utc_now(),
+                    returncode=-1,
+                    failure_stage="squeue",
+                    error=f"squeue unavailable: {exc}",
+                )
+                return _PollingOutcome(
+                    state="failed",
+                    returncode=-1,
+                    objective=None,
+                    reports_sent=reports_sent,
+                    unsafe_to_continue=True,
+                )
+            time.sleep(poll_interval)
+            continue
+        consecutive_squeue_failures = 0
+
+        if state is None:
+            # Job left the queue (terminal). Stop polling.
+            break
+
+        # Only prune while the job is still in the queue, and only after
+        # forwarding a fresh report. A stale should_prune() call could
+        # otherwise fire repeatedly on the same data and waste cluster time.
+        if report_just_sent and optuna_trial.should_prune():
+            pruned = True
+            break
+
+        time.sleep(poll_interval)
+
+    if pruned:
+        cancelled = _scancel_job(jobid)
+        if not cancelled:
+            # scancel could not be confirmed. The SLURM job may still be
+            # running, so we mark the trial unsafe-to-continue: the outer
+            # loop must halt the sweep regardless of continue_on_failure,
+            # because submitting the next Optuna trial would race the
+            # still-active allocation. Resume retains the job id so the
+            # operator can investigate.
+            _write_status(
+                artifact,
+                state="failed",
+                finished_at=utc_now(),
+                returncode=-1,
+                failure_stage="scancel",
+                error=f"scancel did not confirm SLURM job {jobid} left the queue",
+            )
+            return _PollingOutcome(
+                state="failed",
+                returncode=-1,
+                objective=None,
+                reports_sent=reports_sent,
+                unsafe_to_continue=True,
+            )
+        terminal_rc = _slurm_job_terminal_returncode(jobid)
+        record_trial_pruned(
+            artifact.status_path,
+            prune_step,
+            prune_value,
+            returncode=terminal_rc if terminal_rc != 0 else -1,
+            finished_at=utc_now(),
+        )
+        return _PollingOutcome(
+            state="pruned",
+            returncode=terminal_rc if terminal_rc != 0 else -1,
+            objective=None,
+            pruned_at_step=prune_step,
+            pruned_value=prune_value,
+            reports_sent=reports_sent,
+        )
+
+    returncode = _slurm_job_terminal_returncode(jobid)
+    if returncode == 0:
+        objective = read_final_summary(artifact.run_dir, metric)
+        _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
+        return _PollingOutcome(
+            state="completed", returncode=0, objective=objective, reports_sent=reports_sent
+        )
+
+    _write_status(artifact, state="failed", finished_at=utc_now(), returncode=returncode)
+    return _PollingOutcome(
+        state="failed", returncode=returncode, objective=None, reports_sent=reports_sent
+    )
 
 
 EXIT_CODE_FILENAME = "exit_code"
