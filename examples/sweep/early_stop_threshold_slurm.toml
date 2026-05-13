@@ -18,7 +18,7 @@
 #   uv run sweep @ examples/sweep/early_stop_threshold_slurm.toml
 name = "reverse-text-early-stop-threshold-slurm"
 entrypoint = "rl"
-base = ["examples/sweep/rl.toml", "examples/sweep/slurm_base.toml"]
+base = ["examples/reverse_text/rl.toml", "examples/sweep/slurm_base.toml"]
 output_dir = "outputs/studies/reverse-text-early-stop-threshold-slurm"
 
 [strategy]
