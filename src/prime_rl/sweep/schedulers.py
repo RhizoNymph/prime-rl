@@ -62,8 +62,15 @@ def _metrics_jsonl_path(artifact: TrialArtifacts) -> str:
     return (artifact.run_dir / "metrics.jsonl").as_posix()
 
 
+TRAINING_COMPLETE_SENTINEL = ".training_complete"
+"""Marker file written by ``multi_node_rl.sbatch.j2`` immediately before the
+trainer scancels its own job to release the inference allocation. Its presence
+proves a CANCELLED terminal state was the expected self-teardown after a clean
+``max_steps`` exit rather than an external cancel."""
+
+
 def _reset_metrics_jsonl(artifact: TrialArtifacts) -> None:
-    """Truncate the sidecar metrics file before a fresh attempt.
+    """Truncate the sidecar metrics file and clear stale per-attempt markers.
 
     FileMonitor opens in append mode, so without truncation a failed
     attempt's later steps would survive into the retry. read_final_summary
@@ -75,12 +82,20 @@ def _reset_metrics_jsonl(artifact: TrialArtifacts) -> None:
     Legacy ``final_summary.json`` fallback files are attempt-scoped too. If
     the new attempt never writes metrics, stale summaries from an older run
     must not be mistaken for a fresh objective.
+
+    The ``.training_complete`` sentinel (written by multi_node_rl.sbatch.j2
+    right before trainer-rank-0 scancels its own job) is also cleared so a
+    stale marker from a previous attempt does not turn an actual failure
+    into a false "completed".
     """
     path = Path(_metrics_jsonl_path(artifact))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("")
     for summary_path in artifact.run_dir.glob("run-*/final_summary.json"):
         summary_path.unlink()
+    sentinel = artifact.run_dir / TRAINING_COMPLETE_SENTINEL
+    if sentinel.exists():
+        sentinel.unlink()
 
 
 def _build_env(artifact: TrialArtifacts, gpu_group: list[int] | None) -> dict[str, str]:
@@ -378,7 +393,13 @@ def _run_with_retries_slurm_sync(artifact: TrialArtifacts, retry_budget: int) ->
                 _write_launch_failure_status(artifact, exc)
                 return -1
             continue
-        if result.returncode == 0:
+        # ``sbatch --wait`` exits non-zero when the SLURM job is CANCELLED.
+        # multi_node_rl.sbatch.j2 has trainer rank 0 scancel its own job
+        # after a clean exit (to release the inference srun step), so a
+        # successful trial reaches us with rc != 0. The sentinel file
+        # written immediately before that scancel is how we recognize the
+        # expected self-teardown vs an actual job failure.
+        if result.returncode == 0 or _expected_self_cancel(artifact.run_dir):
             _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)
             return 0
         if attempts > retry_budget:
@@ -659,10 +680,18 @@ def _query_scontrol_outcome(jobid: str) -> tuple[str, int | None] | None:
     return state, exit_code
 
 
+def _expected_self_cancel(run_dir: Path | None) -> bool:
+    """Return True when the trial's run_dir contains the self-teardown sentinel."""
+    if run_dir is None:
+        return False
+    return (run_dir / TRAINING_COMPLETE_SENTINEL).exists()
+
+
 def _slurm_job_terminal_outcome(
     jobid: str,
     *,
     timeout_seconds: float = 60.0,
+    run_dir: Path | None = None,
 ) -> Literal["completed", "failed", "unknown"]:
     """Determine whether a SLURM job ended in success, failure, or unknown.
 
@@ -682,11 +711,19 @@ def _slurm_job_terminal_outcome(
     logged the configured objective, but sacct returned nothing because
     accounting was disabled, so the old code recorded it as failed and
     discarded the objective.
+
+    A CANCELLED state combined with the ``run_dir/.training_complete``
+    sentinel is reinterpreted as ``completed``. ``multi_node_rl.sbatch.j2``
+    has trainer rank 0 scancel the SLURM allocation after a clean exit to
+    release the inference srun step; without this carve-out every sweep
+    trial running through that template lands as CANCELLED → failed.
     """
     sacct_state = _wait_for_sacct_terminal_state(jobid, timeout_seconds=timeout_seconds)
     if sacct_state is not None:
         head = sacct_state.split()[0]
         if head in _SLURM_TERMINAL_STATES_OK:
+            return "completed"
+        if head in _SLURM_TERMINAL_STATES_CANCELLED and _expected_self_cancel(run_dir):
             return "completed"
         return "failed"
 
@@ -705,6 +742,8 @@ def _slurm_job_terminal_outcome(
             # a transitional state. Treat as unknown so the caller falls
             # back to evidence from metrics.jsonl rather than guessing.
             return "unknown"
+        if state in _SLURM_TERMINAL_STATES_CANCELLED and _expected_self_cancel(run_dir):
+            return "completed"
         return "failed"
 
     return "unknown"
@@ -932,7 +971,7 @@ def _run_trial_with_pruning_slurm_sync(
     # presence of a finite objective in metrics.jsonl is our last line of
     # evidence that the trial actually ran to completion.
     objective = read_final_summary(artifact.run_dir, metric)
-    outcome = _slurm_job_terminal_outcome(jobid)
+    outcome = _slurm_job_terminal_outcome(jobid, run_dir=artifact.run_dir)
 
     if outcome == "completed":
         _write_status(artifact, state="completed", finished_at=utc_now(), returncode=0)

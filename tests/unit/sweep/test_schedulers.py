@@ -873,3 +873,139 @@ def test_multi_run_lora_retries_launcher_oserror(
         assert status["returncode"] == 0
         assert status["attempts"] == 2
         assert "failure_stage" not in status
+
+
+def test_slurm_sync_cancelled_with_training_complete_sentinel_is_completed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The rl entrypoint's sbatch template has trainer rank 0 scancel its
+    own job after a clean exit, leaving SLURM state=CANCELLED for what was
+    actually a successful trial. Presence of ``.training_complete`` in the
+    run_dir proves this was the expected self-teardown — the trial must be
+    recorded as completed and the objective from metrics.jsonl preserved."""
+    from prime_rl.sweep.schedulers import (
+        TRAINING_COMPLETE_SENTINEL,
+        _run_trial_with_pruning_slurm_sync,
+    )
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="40")
+    fake_state["squeue"] = None
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+    sentinel_path = artifact.run_dir / TRAINING_COMPLETE_SENTINEL
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 19, "val/loss": 0.74}) + "\n")
+        sentinel_path.write_text("")
+        return 0, "40"
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._query_scontrol_outcome",
+        lambda _jid: ("CANCELLED", 0),
+    )
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "completed"
+    assert outcome.objective == 0.74
+
+
+def test_slurm_sync_cancelled_without_sentinel_is_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A CANCELLED state without the self-teardown sentinel is a real
+    failure (operator scancel, pre-empt-as-cancel, etc.) and must NOT be
+    silently promoted to completed just because metrics.jsonl happens to
+    have a row in it."""
+    from prime_rl.sweep.schedulers import _run_trial_with_pruning_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+
+    fake_state = _setup_slurm_sync_fakes(monkeypatch, jobid="41")
+    fake_state["squeue"] = None
+    metrics_path = artifact.run_dir / "metrics.jsonl"
+
+    def fake_submit_after_metrics(_script, _env):
+        metrics_path.write_text(json.dumps({"step": 7, "val/loss": 0.42}) + "\n")
+        return 0, "41"
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._submit_sbatch_parsable", fake_submit_after_metrics
+    )
+    monkeypatch.setattr("prime_rl.sweep.schedulers._query_sacct_state", lambda _jid: None)
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._wait_for_sacct_terminal_state",
+        lambda _jid, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "prime_rl.sweep.schedulers._query_scontrol_outcome",
+        lambda _jid: ("CANCELLED", 0),
+    )
+
+    class _Trial:
+        def report(self, *_):
+            pass
+
+        def should_prune(self):
+            return False
+
+    outcome = _run_trial_with_pruning_slurm_sync(
+        artifact, _Trial(), metric="val/loss", poll_interval=0.01
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.objective is None
+
+
+def test_slurm_sync_sbatch_wait_nonzero_with_sentinel_is_completed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No-pruner SLURM-sync uses ``sbatch --wait``, which returns non-zero
+    when the trainer scancels its own job. The sentinel lets the runner
+    distinguish this expected self-teardown from a real job failure."""
+    from prime_rl.sweep.schedulers import TRAINING_COMPLETE_SENTINEL, _run_with_retries_slurm_sync
+
+    _, artifacts = _materialize(tmp_path, count=1)
+    artifact = artifacts[0]
+    artifact.run_dir.mkdir(parents=True, exist_ok=True)
+    script_path = artifact.run_dir / "sft.sbatch"
+
+    def fake_run(command, env=None):
+        if "--dry-run" in command:
+            script_path.write_text("#!/usr/bin/env bash\n")
+            return SimpleNamespace(returncode=0)
+        # Simulate trainer-rank-0 self-teardown: write the sentinel, then
+        # sbatch --wait surfaces the CANCELLED exit as non-zero.
+        (artifact.run_dir / TRAINING_COMPLETE_SENTINEL).write_text("")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr("prime_rl.sweep.schedulers.subprocess.run", fake_run)
+
+    returncode = _run_with_retries_slurm_sync(artifact, retry_budget=0)
+
+    assert returncode == 0
+    status = json.loads(artifact.status_path.read_text())
+    assert status["state"] == "completed"
+    assert status["returncode"] == 0
