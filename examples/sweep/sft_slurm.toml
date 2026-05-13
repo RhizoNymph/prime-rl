@@ -33,5 +33,11 @@ synchronous = true
 metric = "loss/mean"
 direction = "minimize"
 
+# Disabled so a fresh cluster can run this example without configuring
+# wandb on every compute node. Flip enabled=true once `wandb login` has
+# been run on each node the sweep might land on.
+[wandb]
+enabled = false
+
 [parameters."optim.lr"]
 values = [1e-5, 2e-5, 5e-5]
