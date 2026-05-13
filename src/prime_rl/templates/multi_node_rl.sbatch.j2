@@ -397,7 +397,12 @@ else
     # (which holds the allocation indefinitely via `uv run inference`) shuts
     # down too. Without this, every multi-node RL job hangs until manually
     # scancel-ed, which is fatal for sweeps that submit many trials back-to-back.
+    #
+    # The sentinel marks this scancel as the expected self-teardown after a
+    # clean trainer exit. Sweep controllers check for it when SLURM reports
+    # CANCELLED so the trial is recorded as completed rather than failed.
     if [ "$TRAIN_NODE_RANK" -eq 0 ]; then
+        touch "$OUTPUT_DIR/.training_complete"
         scancel "$SLURM_JOB_ID"
     fi
     fi{% endif %}
