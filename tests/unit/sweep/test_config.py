@@ -756,23 +756,23 @@ def test_slurm_max_parallel_requires_synchronous(tmp_path: Path) -> None:
         )
 
 
-def test_slurm_max_parallel_rejects_pruner(tmp_path: Path) -> None:
-    """Parallel SLURM-sync rejects pruners: the pruning loop owns the
-    optuna_trial object for the trial's lifetime, and Optuna trial
-    objects are not thread-safe to share across polling threads."""
-    with pytest.raises(ValidationError, match="pruners are not yet supported with SLURM max_parallel"):
-        SweepConfig(
-            base=[tmp_path / "base.toml"],
-            output_dir=tmp_path / "study",
-            scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
-            strategy={
-                "type": "optuna",
-                "num_trials": 6,
-                "pruner": {"type": "median"},
-            },
-            parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
-            objective={"metric": "reward", "direction": "maximize"},
-        )
+def test_slurm_max_parallel_accepts_pruner(tmp_path: Path) -> None:
+    """Parallel SLURM-sync now supports pruners: each worker thread holds
+    its own optuna_trial from study.ask(), and Optuna's storage backend
+    serializes concurrent report/should_prune calls across threads — the
+    same contract that makes Optuna's own study.optimize(n_jobs>1) work."""
+    SweepConfig(
+        base=[tmp_path / "base.toml"],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
+        strategy={
+            "type": "optuna",
+            "num_trials": 6,
+            "pruner": {"type": "median"},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+    )
 
 
 def test_early_stopping_accepts_synchronous_slurm_scheduler(tmp_path: Path) -> None:

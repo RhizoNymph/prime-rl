@@ -2434,3 +2434,199 @@ def test_parallel_slurm_sync_failed_trial_continues_with_continue_on_failure(
     # defaults to True.
     assert exc_info.value.code == 1
     assert calls["n"] == 4
+
+
+def test_parallel_slurm_sync_pruner_routes_through_pruning_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the strategy has a non-trivial pruner, the parallel driver
+    must hand each worker its optuna_trial and dispatch to the pruning
+    runner rather than the no-pruner runner."""
+    import threading
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    inflight_lock = threading.Lock()
+    inflight = 0
+    peak_inflight = 0
+    pruning_worker_calls: list[str] = []
+    no_pruner_worker_calls: list[str] = []
+
+    def fake_pruning_worker(artifact, optuna_trial, metric, poll_interval, retry_budget):
+        nonlocal inflight, peak_inflight
+        with inflight_lock:
+            inflight += 1
+            peak_inflight = max(peak_inflight, inflight)
+        pruning_worker_calls.append(artifact.trial.id)
+        try:
+            import time as _time
+            _time.sleep(0.15)
+            value = 0.5
+            artifact.run_dir.mkdir(parents=True, exist_ok=True)
+            (artifact.run_dir / "metrics.jsonl").write_text(
+                json.dumps({metric: value, "step": 1}) + "\n"
+            )
+            from prime_rl.sweep.optuna_loop import _PollingOutcome
+            return _PollingOutcome(
+                state="completed", returncode=0, objective=value
+            )
+        finally:
+            with inflight_lock:
+                inflight -= 1
+
+    def fake_no_pruner_worker(artifact, metric, retry_budget):
+        no_pruner_worker_calls.append(artifact.trial.id)
+        from prime_rl.sweep.optuna_loop import _SlurmSyncWorkerResult
+        return _SlurmSyncWorkerResult(returncode=0, objective=0.5)
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_with_pruner", fake_pruning_worker
+    )
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_no_pruner", fake_no_pruner_worker
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 3},
+        strategy={
+            "type": "optuna",
+            "num_trials": 6,
+            "sampler": "tpe",
+            "seed": 7,
+            "pruner": {"type": "median"},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # All 6 trials should route to the pruning worker, none to the
+    # no-pruner worker.
+    assert len(pruning_worker_calls) == 6
+    assert no_pruner_worker_calls == []
+    # Peak concurrency > 1 confirms the threaded driver parallelizes the
+    # pruning workers (Optuna ask/tell stays on the main thread, but
+    # workers run their polling loops concurrently).
+    assert peak_inflight >= 2, f"expected peak_inflight >= 2, got {peak_inflight}"
+    assert peak_inflight <= 3
+
+
+def test_parallel_slurm_sync_pruned_outcome_tells_optuna_pruned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A worker returning state='pruned' must result in study.tell with
+    TrialState.PRUNED (not FAIL, not COMPLETE) and no objective recorded."""
+    import optuna as _optuna
+
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    told_states: list = []
+
+    def fake_pruning_worker(artifact, optuna_trial, metric, poll_interval, retry_budget):
+        from prime_rl.sweep.optuna_loop import _PollingOutcome
+        return _PollingOutcome(
+            state="pruned",
+            returncode=-1,
+            objective=None,
+            pruned_at_step=3,
+            pruned_value=0.2,
+            reports_sent=1,
+        )
+
+    real_tell = _optuna.Study.tell
+
+    def spy_tell(self, trial, values=None, state=None, **kwargs):
+        told_states.append(state)
+        return real_tell(self, trial, values=values, state=state, **kwargs)
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_with_pruner", fake_pruning_worker
+    )
+    monkeypatch.setattr(_optuna.Study, "tell", spy_tell)
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 2},
+        strategy={
+            "type": "optuna",
+            "num_trials": 3,
+            "sampler": "tpe",
+            "seed": 7,
+            "pruner": {"type": "median"},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+    )
+
+    run_sweep(config)
+
+    # All 3 trials should have been told as PRUNED — never None (success)
+    # and never FAIL.
+    assert told_states == [
+        _optuna.trial.TrialState.PRUNED,
+        _optuna.trial.TrialState.PRUNED,
+        _optuna.trial.TrialState.PRUNED,
+    ]
+
+
+def test_parallel_slurm_sync_pruner_unsafe_to_continue_halts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If a pruning worker returns unsafe_to_continue=True (persistent
+    squeue failure or unconfirmed scancel), the driver must halt new
+    submissions even with continue_on_failure=True (the default).
+    The underlying SLURM job may still be alive."""
+    base_path = tmp_path / "base.toml"
+    write_toml(base_path, {"data": {"type": "fake"}, "max_steps": 1})
+
+    calls = {"n": 0}
+
+    def fake_pruning_worker(artifact, optuna_trial, metric, poll_interval, retry_budget):
+        from prime_rl.sweep.optuna_loop import _PollingOutcome
+        calls["n"] += 1
+        return _PollingOutcome(
+            state="failed",
+            returncode=-1,
+            objective=None,
+            unsafe_to_continue=True,
+        )
+
+    monkeypatch.setattr(
+        "prime_rl.sweep.optuna_loop._run_one_slurm_sync_with_pruner", fake_pruning_worker
+    )
+
+    config = SweepConfig(
+        entrypoint="sft",
+        base=[base_path],
+        output_dir=tmp_path / "study",
+        scheduler={"type": "slurm", "synchronous": True, "max_parallel": 2},
+        strategy={
+            "type": "optuna",
+            "num_trials": 10,
+            "sampler": "tpe",
+            "seed": 7,
+            "pruner": {"type": "median"},
+        },
+        parameters={"optim.lr": {"distribution": "log_uniform", "min": 1e-6, "max": 1e-4}},
+        objective={"metric": "reward", "direction": "maximize"},
+        wandb=None,
+        # default continue_on_failure=True — unsafe_to_continue should
+        # still halt the sweep.
+    )
+
+    with pytest.raises(SystemExit):
+        run_sweep(config)
+
+    # Initial fill of max_parallel=2 trials runs; both come back
+    # unsafe_to_continue. No more submissions after that. Total <= 2.
+    assert calls["n"] <= 2, f"expected <= 2 trials, got {calls['n']}"

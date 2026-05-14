@@ -956,17 +956,6 @@ class SweepConfig(BaseConfig):
                     "must be 1. Use scheduler.type='slurm' with synchronous=true to drive "
                     "max_parallel > 1 over SLURM."
                 )
-            if (
-                isinstance(self.scheduler, SlurmSweepSchedulerConfig)
-                and self.scheduler.max_parallel > 1
-                and not isinstance(self.strategy.pruner, NoPrunerConfig)
-            ):
-                raise ValueError(
-                    "Optuna pruners are not yet supported with SLURM max_parallel > 1. The "
-                    "pruning loop owns the optuna_trial object for the lifetime of a single "
-                    "trial, and Optuna trial objects are not thread-safe to share across "
-                    "polling threads. Use pruner.type='none' for parallel SLURM sweeps."
-                )
             if self.resume and self.strategy.storage is None:
                 raise ValueError(
                     "Resume with the Optuna strategy requires strategy.storage so the study "
