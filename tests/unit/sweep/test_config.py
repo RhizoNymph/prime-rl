@@ -533,15 +533,17 @@ def test_float_distributions_reject_non_finite_bounds(
         )
 
 
-def test_resume_and_clean_output_dir_are_mutually_exclusive(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="mutually exclusive"):
-        SweepConfig(
+def test_resume_overrides_clean_output_dir(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning, match="resume=true takes precedence"):
+        config = SweepConfig(
             base=[tmp_path / "base.toml"],
             output_dir=tmp_path / "study",
             parameters={"optim.lr": {"values": [1e-5]}},
             resume=True,
             clean_output_dir=True,
         )
+    assert config.resume is True
+    assert config.clean_output_dir is False
 
 
 def test_resume_rejects_unseeded_random_strategy(tmp_path: Path) -> None:

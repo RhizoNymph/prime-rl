@@ -1,4 +1,5 @@
 import math
+import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -887,7 +888,12 @@ class SweepConfig(BaseConfig):
                 f"{path_conflicts}. Split these into separate sweeps or choose one override shape."
             )
         if self.resume and self.clean_output_dir:
-            raise ValueError("resume and clean_output_dir are mutually exclusive")
+            warnings.warn(
+                "resume=true takes precedence over clean_output_dir=true; "
+                "ignoring clean_output_dir so existing trial state is preserved.",
+                stacklevel=2,
+            )
+            self.clean_output_dir = False
         if isinstance(self.strategy, GridStrategyConfig):
             non_choice = [
                 path for path, parameter in self.parameters.items() if not isinstance(parameter, ChoiceParameterConfig)
