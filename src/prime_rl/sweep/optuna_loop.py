@@ -1028,17 +1028,41 @@ def _run_one_slurm_sync_no_pruner(
     metric: str,
     retry_budget: int,
 ) -> _SlurmSyncWorkerResult:
-    """Worker function for parallel SLURM-sync sweeps.
+    """Worker function for parallel SLURM-sync sweeps without a pruner.
 
     Synchronous SLURM with no pruner: submit with ``sbatch --wait`` (via
     ``_run_with_retries_slurm_sync``) and read the final objective from
-    metrics.jsonl on success. Pruning is rejected upstream for parallel
-    mode because Optuna trial objects are not safe to share across
-    polling threads.
+    metrics.jsonl on success.
     """
     returncode = _run_with_retries_slurm_sync(artifact, retry_budget)
     objective = read_final_summary(artifact.run_dir, metric) if returncode == 0 else None
     return _SlurmSyncWorkerResult(returncode=returncode, objective=objective)
+
+
+def _run_one_slurm_sync_with_pruner(
+    artifact: TrialArtifacts,
+    optuna_trial: "optuna.Trial",  # noqa: F821 — forward ref for optional dep
+    metric: str,
+    poll_interval: float,
+    retry_budget: int,
+) -> "_PollingOutcome":
+    """Worker function for parallel SLURM-sync sweeps with a pruner.
+
+    Delegates to ``_run_trial_with_pruning_slurm_sync_and_retries`` (the
+    same code path used by the serial pruner+SLURM-sync runner). Optuna's
+    storage backend serializes concurrent ``report``/``should_prune``
+    calls across worker threads — Optuna's own ``study.optimize(n_jobs>1)``
+    documents this contract — so each worker holding its own
+    ``optuna_trial`` is safe even when N polling threads call
+    ``should_prune`` simultaneously against the same study.
+    """
+    return _run_trial_with_pruning_slurm_sync_and_retries(
+        artifact,
+        optuna_trial,
+        metric,
+        poll_interval,
+        retry_budget,
+    )
 
 
 def run_optuna_sweep_parallel_slurm(
@@ -1055,12 +1079,20 @@ def run_optuna_sweep_parallel_slurm(
     Optuna the outcome and immediately asks for one more trial to refill
     the slot, until ``num_trials`` is reached or a halt condition fires.
 
+    Pruners are supported under parallel SLURM-sync as of this PR. Each
+    worker holds its own ``optuna_trial`` (each from a distinct
+    ``study.ask()``) and runs the same polling loop the serial pruner
+    runner uses. Optuna's storage backend serializes the concurrent
+    ``report``/``should_prune`` calls across threads, the same contract
+    that makes ``study.optimize(n_jobs>1)`` work in stock Optuna.
+
     Halt conditions:
     - ``tracker.observe`` returns True → stop submitting new trials, wait
       for in-flight to finish (early stopping).
-    - ``unsafe_to_continue`` from a worker (unreachable today — only the
-      pruning runner emits it, and pruning is rejected for parallel mode —
-      but the plumbing is in place for future variants).
+    - ``unsafe_to_continue`` from a worker (persistent squeue failure or
+      unconfirmed scancel during a prune) → halt new submissions, drain.
+      Only fires when a pruner is active (the no-pruner runner doesn't
+      emit it).
     - ``not config.continue_on_failure`` after any failure → halt new
       submissions, drain.
     """
@@ -1071,9 +1103,9 @@ def run_optuna_sweep_parallel_slurm(
     assert isinstance(strategy, OptunaStrategyConfig)
     assert isinstance(config.scheduler, SlurmSweepSchedulerConfig)
     assert config.scheduler.synchronous, "parallel SLURM requires synchronous=true"
-    assert isinstance(strategy.pruner, NoPrunerConfig), "parallel SLURM rejects pruners upstream"
     max_parallel = config.scheduler.max_parallel
     assert max_parallel > 1
+    use_pruner = not isinstance(strategy.pruner, NoPrunerConfig)
 
     study = _create_study(optuna, config)
     tracker = TrialOutcomeTracker(config.objective, config.early_stopping) if config.objective else None
@@ -1162,12 +1194,22 @@ def run_optuna_sweep_parallel_slurm(
                     if not config.continue_on_failure:
                         return False
                     continue
-                future = executor.submit(
-                    _run_one_slurm_sync_no_pruner,
-                    artifact,
-                    config.objective.metric,
-                    config.retry_budget,
-                )
+                if use_pruner:
+                    future = executor.submit(
+                        _run_one_slurm_sync_with_pruner,
+                        artifact,
+                        optuna_trial,
+                        config.objective.metric,
+                        strategy.poll_interval_seconds,
+                        config.retry_budget,
+                    )
+                else:
+                    future = executor.submit(
+                        _run_one_slurm_sync_no_pruner,
+                        artifact,
+                        config.objective.metric,
+                        config.retry_budget,
+                    )
                 in_flight[future] = (optuna_trial, artifact)
                 return True
 
@@ -1196,20 +1238,56 @@ def run_optuna_sweep_parallel_slurm(
                     continue
 
                 objective_value = result.objective
-                returncode = result.returncode
-                record_trial_objective(artifact.status_path, objective_value)
-
-                if objective_value is None:
-                    if returncode == 0:
-                        record_trial_missing_objective(artifact.status_path, config.objective.metric)
-                    study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                if isinstance(result, _PollingOutcome):
+                    # Pruner path: result carries a tristate (completed/
+                    # pruned/failed) plus the unsafe_to_continue flag for
+                    # the SLURM-specific failure modes.
+                    if result.state == "completed":
+                        record_trial_objective(artifact.status_path, objective_value)
+                        if objective_value is None:
+                            record_trial_missing_objective(
+                                artifact.status_path, config.objective.metric
+                            )
+                            study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                            failures += 1
+                            if not config.continue_on_failure:
+                                halted = True
+                        else:
+                            study.tell(optuna_trial, objective_value)
+                    elif result.state == "pruned":
+                        # record_trial_pruned already set status.json fields
+                        # in the worker; just tell Optuna so the sampler
+                        # treats this trial as a deliberate stop.
+                        study.tell(optuna_trial, state=optuna.trial.TrialState.PRUNED)
+                    else:  # failed
+                        record_trial_objective(artifact.status_path, None)
+                        study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                        failures += 1
+                        if not config.continue_on_failure or result.unsafe_to_continue:
+                            # unsafe_to_continue forces halt regardless of
+                            # continue_on_failure: persistent squeue
+                            # failure or unconfirmed scancel means the
+                            # SLURM job may still be alive and submitting
+                            # the next trial would race it.
+                            halted = True
                 else:
-                    study.tell(optuna_trial, objective_value)
+                    # No-pruner path: result is _SlurmSyncWorkerResult.
+                    returncode = result.returncode
+                    record_trial_objective(artifact.status_path, objective_value)
 
-                if returncode != 0 or objective_value is None:
-                    failures += 1
-                    if not config.continue_on_failure:
-                        halted = True
+                    if objective_value is None:
+                        if returncode == 0:
+                            record_trial_missing_objective(
+                                artifact.status_path, config.objective.metric
+                            )
+                        study.tell(optuna_trial, state=optuna.trial.TrialState.FAIL)
+                    else:
+                        study.tell(optuna_trial, objective_value)
+
+                    if returncode != 0 or objective_value is None:
+                        failures += 1
+                        if not config.continue_on_failure:
+                            halted = True
 
                 if tracker is not None:
                     if tracker.observe(
