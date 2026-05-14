@@ -199,3 +199,6 @@ debug_I2_zero_band
 .idea
 
 outputs/
+
+# Runtime flock used to serialize `uv sync` across concurrent SLURM jobs.
+.uv-sync.lock
